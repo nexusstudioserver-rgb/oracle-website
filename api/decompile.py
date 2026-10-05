@@ -880,6 +880,43 @@ def _referents(vals):
     return bytes(out)
 
 
+def lz4_decompress_block(src, out_size):
+    """LZ4 block format -> bytes.  Only used to re-read what lz4_compress_block
+    just wrote, so the writer can prove its own chunks are valid before the file
+    is handed over."""
+    out = bytearray()
+    i, n = 0, len(src)
+    while i < n:
+        token = src[i]; i += 1
+        lit = token >> 4
+        if lit == 15:
+            while i < n:
+                b = src[i]; i += 1
+                lit += b
+                if b != 255:
+                    break
+        out += src[i:i + lit]; i += lit
+        if i + 2 > n or len(out) >= out_size:
+            break
+        off = src[i] | (src[i + 1] << 8); i += 2
+        if off == 0 or off > len(out):
+            raise ValueError("corrupt LZ4 block")
+        mlen = token & 0x0F
+        if mlen == 15:
+            while i < n:
+                b = src[i]; i += 1
+                mlen += b
+                if b != 255:
+                    break
+        mlen += 4
+        start = len(out) - off
+        for k in range(mlen):
+            out.append(out[start + k])
+    if out_size and len(out) != out_size:
+        raise ValueError("LZ4 block gave %d bytes, expected %d" % (len(out), out_size))
+    return bytes(out)
+
+
 # ------------------------------------------------------------------- builder --
 #  The file has to match what Roblox Studio writes, exactly:
 #    * referents are transformed (zig-zag) 32-bit ints, delta-accumulated,
@@ -965,11 +1002,14 @@ def build_binary_place(scripts):
         leaf["class"] = cls
         leaf["source"] = body
 
-    # ---- 2. number every instance (referents are ours to choose) -----------
+    # ---- 2. number every instance ------------------------------------------
+    #  Referents must be a dense run 0..N-1.  Studio refuses the file outright
+    #  ("Invalid id N/N") if any referent reaches N, so the first one is 0; a
+    #  root instance's parent is the null referent -1.
     flat = []          # (referent, class, name, source, parent ref, is_service)
 
     def walk(node, parent_ref):
-        ref = len(flat) + 1
+        ref = len(flat)
         flat.append((ref, node["class"], node["name"], node["source"], parent_ref,
                      node["service"]))
         for kid in node["kids"]:
@@ -1048,7 +1088,83 @@ def build_binary_place(scripts):
 
     # the END chunk holds </roblox> and is never compressed
     out += b"END\x00" + struct.pack("<III", 0, 9, 0) + b"</roblox>"
+
+    problems = check_binary_place(bytes(out))
+    if problems:
+        raise ValueError("refusing to write a place Studio would reject: "
+                         + "; ".join(problems))
     return bytes(out)
+
+
+def check_binary_place(data):
+    """The rules Roblox Studio enforces when opening a place. Returns a list of
+    problems (empty = good).  Runs on every build, and in the tests."""
+    bad = []
+    if data[:8] != b"<roblox!":
+        return ["not a Roblox binary file"]
+    count = struct.unpack_from("<i", data, 20)[0]
+    refs, parents, seen = [], {}, set()
+    off = 32
+    while off + 16 <= len(data):
+        name = data[off:off + 4]
+        clen, ulen, _r = struct.unpack_from("<III", data, off + 4)
+        off += 16
+        body = data[off:off + (clen or ulen)]
+        off += (clen or ulen)
+        if clen:
+            if body[:4] == b"\x28\xb5\x2f\xfd":
+                return ["ZSTD chunks are not written by this builder"]
+            try:
+                body = lz4_decompress_block(body, ulen)
+            except Exception as exc:
+                bad.append("%s chunk is not valid LZ4: %s"
+                           % (name.rstrip(b"\x00").decode("latin1"), exc))
+                continue
+        if name == b"END\x00":
+            if body != b"</roblox>":
+                bad.append("the END chunk must hold </roblox>")
+            break
+        if name == b"INST":
+            n = struct.unpack_from("<I", body, 4)[0]
+            i_count = struct.unpack_from("<I", body, 4 + 4 + n + 1)[0]
+            got, _p = _read_refs(body, 4 + 4 + n + 1 + 4, i_count)
+            refs.extend(got)
+        elif name == b"PRNT":
+            i_count = struct.unpack_from("<I", body, 1)[0]
+            kids, p = _read_refs(body, 5, i_count)
+            pars, _p = _read_refs(body, p, i_count)
+            for kid, par in zip(kids, pars):
+                parents[kid] = par
+    if len(refs) != count:
+        bad.append("header says %d instances but the chunks describe %d"
+                   % (count, len(refs)))
+    for r in refs:
+        if r in seen:
+            bad.append("referent %d used twice" % r)
+        seen.add(r)
+        if r < 0 or r >= count:
+            bad.append("referent %d is outside 0..%d" % (r, count - 1))
+    for kid, par in parents.items():
+        if par != -1 and par not in seen:
+            bad.append("instance %d has parent %d, which is not in the file" % (kid, par))
+    missing = seen - set(parents)
+    if missing:
+        bad.append("%d instance(s) have no parent entry" % len(missing))
+    return bad
+
+
+def _read_refs(buf, off, count):
+    """Referents: big-endian transformed ints, byte-interleaved, accumulated."""
+    raw = bytearray(buf[off:off + count * 4])
+    out = bytearray(count * 4)
+    for w in range(4):
+        out[w::4] = raw[w * count:(w + 1) * count]
+    acc, vals = 0, []
+    for i in range(count):
+        v = struct.unpack_from(">i", out, i * 4)[0]
+        acc += (v >> 1) ^ -(v & 1)
+        vals.append(acc)
+    return vals, off + count * 4
 
 # ===========================================================================
 #  Roblox binary place/model  ->  list of scripts
@@ -1624,6 +1740,11 @@ class handler(BaseHTTPRequestHandler):
 
         try:
             blob = build_binary_place(record["scripts"])
+            # last line of defence: if the file breaks any rule Studio checks,
+            # say so instead of handing over a place that opens empty
+            problems = check_binary_place(blob)
+            if problems:
+                raise ValueError("; ".join(problems[:3]))
         except Exception as exc:
             self._reply(200, json.dumps({"ok": False,
                                          "error": "could not build the place file: %s" % exc}),
