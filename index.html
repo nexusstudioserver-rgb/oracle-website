@@ -381,84 +381,338 @@
 
 <script>
 /*  =========================================================================
-    DOWNLOAD -> the whole game as a .rbxl place file
+    DOWNLOAD -> the whole game as a .rbxl place file, built right here
 
-    Dropping a game shows every script in one long document. The Download
-    button turns that back into the file the game came from: a Roblox binary
-    place (.rbxl) with one instance per script in the same folder tree and the
-    decompiled source inside each Script / LocalScript / ModuleScript - open it
-    in Roblox Studio and read them there.
+    The page already holds every script of the game (that is the document in
+    the editor).  This turns that document back into the file the game came
+    from: a Roblox binary place (.rbxl) with one instance per script in the
+    same folder tree and the decompiled source inside each Script /
+    LocalScript / ModuleScript - open it in Roblox Studio and read it there.
 
-    The document header carries the id of the script list the engine kept
-    (-- @place {"id": ...}); asking for that id gives the place back in
-    numbered pieces, because it is bigger than one reply may carry. If the
-    engine has forgotten the id (it restarts now and then), the plain text
-    document is saved instead - never nothing.
+    Built in the browser on purpose: no server has to remember your game, so
+    it works the same for every game, on the website and on file://.
+
+    If anything here fails, the click falls back to asking the engine for the
+    file, and if that fails too it saves the document as text - never nothing.
     ========================================================================= */
 (function () {
+  var SCRIPT_CLASSES = { Script: 1, LocalScript: 1, ModuleScript: 1 };
+  var SERVICES = {
+    Workspace: 1, Players: 1, Lighting: 1, ReplicatedFirst: 1,
+    ReplicatedStorage: 1, ServerScriptService: 1, ServerStorage: 1,
+    StarterGui: 1, StarterPack: 1, StarterPlayer: 1, SoundService: 1,
+    Chat: 1, Teams: 1, TextChatService: 1, MaterialService: 1,
+    LocalizationService: 1, ProximityPromptService: 1, TestService: 1,
+    VoiceChatService: 1
+  };
+  var CONTAINERS = {
+    StarterPlayerScripts: 1, StarterCharacterScripts: 1, Camera: 1, Terrain: 1
+  };
+  var encoder = new TextEncoder();
+
+  /* ------------------------------------------------------------ bytes ---- */
+  function Buf() { this.a = new Uint8Array(4096); this.n = 0; }
+  Buf.prototype.need = function (k) {
+    if (this.n + k <= this.a.length) { return; }
+    var cap = this.a.length;
+    while (cap < this.n + k) { cap *= 2; }
+    var bigger = new Uint8Array(cap);
+    bigger.set(this.a.subarray(0, this.n));
+    this.a = bigger;
+  };
+  Buf.prototype.u8 = function (v) { this.need(1); this.a[this.n++] = v & 255; };
+  Buf.prototype.bytes = function (b) { this.need(b.length); this.a.set(b, this.n); this.n += b.length; };
+  Buf.prototype.u32 = function (v) {
+    this.need(4);
+    this.a[this.n++] = v & 255; this.a[this.n++] = (v >>> 8) & 255;
+    this.a[this.n++] = (v >>> 16) & 255; this.a[this.n++] = (v >>> 24) & 255;
+  };
+  Buf.prototype.out = function () { return this.a.subarray(0, this.n); };
+  function ustr(text) {
+    var b = encoder.encode(text);
+    var w = new Buf(); w.u32(b.length); w.bytes(b); return w.out();
+  }
+
+  /* -------------------------------------------------- LZ4 block ---------- */
+  /* The same compressor the server uses (greedy 64K hash table), so the files
+     this builds are identical to the ones the engine builds. */
+  function lz4CompressBlock(src) {
+    var n = src.length, w = new Buf();
+    if (n === 0) { w.u8(0); return w.out(); }
+    var tbl = new Int32Array(65536);
+    for (var t = 0; t < 65536; t++) { tbl[t] = -1; }
+    var anchor = 0, i = 0, last = n - 5, mfl = n - 12;
+    while (i < mfl) {
+      var v = (src[i] | (src[i + 1] << 8) | (src[i + 2] << 16) | (src[i + 3] << 24)) >>> 0;
+      var h = (Math.imul(v, 2654435761) >>> 16) & 0xffff;
+      var cand = tbl[h]; tbl[h] = i;
+      if (cand >= 0 && i - cand <= 65535 &&
+          src[cand] === src[i] && src[cand + 1] === src[i + 1] &&
+          src[cand + 2] === src[i + 2] && src[cand + 3] === src[i + 3]) {
+        var m = i + 4, j = cand + 4;
+        while (m < last && src[m] === src[j]) { m++; j++; }
+        var lit = i - anchor, ml = m - 4 - i, r;
+        w.u8(((lit >= 15 ? 15 : lit) << 4) | (ml >= 15 ? 15 : ml));
+        if (lit >= 15) { r = lit - 15; while (r >= 255) { w.u8(255); r -= 255; } w.u8(r); }
+        w.bytes(src.subarray(anchor, i));
+        var off = i - cand;
+        w.u8(off & 255); w.u8((off >> 8) & 255);
+        if (ml >= 15) { r = ml - 15; while (r >= 255) { w.u8(255); r -= 255; } w.u8(r); }
+        i = m; anchor = m;
+      } else { i++; }
+    }
+    var tail = n - anchor, q;
+    w.u8((tail >= 15 ? 15 : tail) << 4);
+    if (tail >= 15) { q = tail - 15; while (q >= 255) { w.u8(255); q -= 255; } w.u8(q); }
+    w.bytes(src.subarray(anchor));
+    return w.out();
+  }
+
+  function chunk(name, payload) {
+    var comp = lz4CompressBlock(payload), w = new Buf();
+    w.bytes(name); w.u32(comp.length); w.u32(payload.length); w.u32(0); w.bytes(comp);
+    return w.out();
+  }
+
+  /* ------------------------------------------------- the place file ------ */
+  /* Referents are a dense run 0..N-1 (Studio rejects the file if any id
+     reaches N), names live in a Name property, services carry markers, and
+     the file ends with the literal </roblox>. */
+  function referents(vals) {
+    var n = vals.length, raw = new Uint8Array(n * 4), out = new Uint8Array(n * 4);
+    var prev = 0;
+    for (var k = 0; k < n; k++) {
+      var d = (vals[k] - prev) | 0; prev = vals[k] | 0;
+      var z = ((d << 1) ^ (d >> 31)) >>> 0;
+      raw[k * 4] = (z >>> 24) & 255; raw[k * 4 + 1] = (z >>> 16) & 255;
+      raw[k * 4 + 2] = (z >>> 8) & 255; raw[k * 4 + 3] = z & 255;
+    }
+    for (var w = 0; w < 4; w++) {
+      for (var i = 0; i < n; i++) { out[w * n + i] = raw[i * 4 + w]; }
+    }
+    return out;
+  }
+
+  function nameOf(text) {
+    var s = String(text == null ? '' : text)
+      .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').trim();
+    s = Array.from(s).slice(0, 80).join('');
+    return s || 'Unnamed';
+  }
+
+  function buildPlace(scripts) {
+    /* 1. the tree */
+    var root = { cls: null, name: '', kids: [], index: new Map(), source: null, service: false };
+    function child(parent, name, cls, top, unique) {
+      var node = parent.index.get(name);
+      if (node && !unique) { return node; }
+      if (node) {                                   /* siblings may share a name */
+        var k = 2;
+        while (parent.index.has(name + ' (' + k + ')')) { k++; }
+        name = name + ' (' + k + ')';
+      }
+      var real = cls;
+      if (top && SERVICES[name]) { real = name; }
+      else if (CONTAINERS[name]) { real = name; }
+      node = { cls: real, name: name, kids: [], index: new Map(), source: null,
+               service: !!(top && SERVICES[name]) };
+      parent.kids.push(node);
+      parent.index.set(name, node);
+      return node;
+    }
+    for (var s = 0; s < scripts.length; s++) {
+      var item = scripts[s];
+      var parts = String(item.path || '').split('/').filter(function (p) { return p; });
+      var cls = SCRIPT_CLASSES[item.cls] ? item.cls : 'Script';
+      if (!parts.length) { parts = ['Unnamed']; }
+      var cur = root, i;
+      for (i = 0; i < parts.length - 1; i++) { cur = child(cur, nameOf(parts[i]), 'Folder', i === 0, false); }
+      var leaf = child(cur, nameOf(parts[parts.length - 1]), cls, false, true);
+      leaf.cls = cls;
+      leaf.source = item.body || '';
+    }
+
+    /* 2. every instance numbered 0..N-1, children before parents */
+    var flat = [];
+    function walk(node, parentRef) {
+      var ref = flat.length;
+      flat.push([ref, node.cls, node.name, node.source, parentRef, node.service]);
+      for (var k = 0; k < node.kids.length; k++) { walk(node.kids[k], ref); }
+    }
+    for (var r0 = 0; r0 < root.kids.length; r0++) { walk(root.kids[r0], -1); }
+
+    var byClass = new Map(), childrenOf = new Map(), k2;
+    for (k2 = 0; k2 < flat.length; k2++) {
+      var it = flat[k2];
+      if (!byClass.has(it[1])) { byClass.set(it[1], []); }
+      byClass.get(it[1]).push(it);
+      if (!childrenOf.has(it[4])) { childrenOf.set(it[4], []); }
+      if (!childrenOf.has(it[0])) { childrenOf.set(it[0], []); }
+      childrenOf.get(it[4]).push(it[0]);
+    }
+    var classes = Array.from(byClass.keys()).sort();
+    var prntKids = [], prntParents = [], seen = new Set();
+    function emit(ref) {
+      if (seen.has(ref)) { return; }
+      seen.add(ref);
+      var kids = childrenOf.get(ref) || [];
+      for (var k = 0; k < kids.length; k++) { emit(kids[k]); }
+      prntKids.push(ref);
+    }
+    var roots0 = childrenOf.get(-1) || [];
+    for (var r1 = 0; r1 < roots0.length; r1++) { emit(roots0[r1]); }
+    for (k2 = 0; k2 < prntKids.length; k2++) {
+      var ref2 = prntKids[k2];
+      for (var j = 0; j < flat.length; j++) {
+        if (flat[j][0] === ref2) { prntParents.push(flat[j][4]); break; }
+      }
+    }
+
+    /* 3. the chunks */
+    var out = new Buf();
+    out.bytes(encoder.encode('<roblox!'));
+    out.bytes(new Uint8Array([0x89, 0xFF, 0x0D, 0x0A, 0x1A, 0x0A]));
+    out.u8(0); out.u8(0);                                 /* version 0 */
+    out.u32(classes.length);
+    out.u32(flat.length);
+    for (k2 = 0; k2 < 8; k2++) { out.u8(0); }             /* reserved */
+
+    var c, items, body;
+    for (c = 0; c < classes.length; c++) {
+      items = byClass.get(classes[c]);
+      body = new Buf();
+      body.u32(c); body.bytes(ustr(classes[c]));
+      var anyService = false;
+      for (k2 = 0; k2 < items.length; k2++) { if (items[k2][5]) { anyService = true; break; } }
+      body.u8(anyService ? 1 : 0);
+      body.u32(items.length);
+      var refs = [];
+      for (k2 = 0; k2 < items.length; k2++) { refs.push(items[k2][0]); }
+      body.bytes(referents(refs));
+      if (anyService) { for (k2 = 0; k2 < items.length; k2++) { body.u8(items[k2][5] ? 1 : 0); } }
+      out.bytes(chunk(encoder.encode('INST'), body.out()));
+    }
+    for (c = 0; c < classes.length; c++) {
+      items = byClass.get(classes[c]);
+      body = new Buf();
+      body.u32(c); body.bytes(ustr('Name')); body.u8(0x01);
+      for (k2 = 0; k2 < items.length; k2++) { body.bytes(ustr(items[k2][2])); }
+      out.bytes(chunk(encoder.encode('PROP'), body.out()));
+    }
+    for (c = 0; c < classes.length; c++) {
+      if (!SCRIPT_CLASSES[classes[c]]) { continue; }
+      items = byClass.get(classes[c]);
+      body = new Buf();
+      body.u32(c); body.bytes(ustr('Source')); body.u8(0x01);
+      for (k2 = 0; k2 < items.length; k2++) { body.bytes(ustr(items[k2][3] || '')); }
+      out.bytes(chunk(encoder.encode('PROP'), body.out()));
+    }
+    body = new Buf();
+    body.u8(0); body.u32(prntKids.length);
+    body.bytes(referents(prntKids)); body.bytes(referents(prntParents));
+    out.bytes(chunk(encoder.encode('PRNT'), body.out()));
+
+    out.bytes(encoder.encode('END\u0000'));
+    out.u32(0); out.u32(9); out.u32(0);
+    out.bytes(encoder.encode('</roblox>'));
+    return out.out();
+  }
+
+  /* ------------------------------------------ read the document ---------- */
+  /* Every script sits behind a machine-readable label.  The three comment
+     lines after it are checked too, so the words "-- @script" inside a game's
+     own code can never be mistaken for the start of a script. */
+  function parseDocument(text) {
+    var re = /^-- @script (\{[^\n]*\})/gm, cuts = [], m;
+    while ((m = re.exec(text)) !== null) {
+      var after = m.index + m[0].length;
+      var head = text.substr(after, 400);
+      var ok = /^\n-- -{5,}\n-- [^\n]*\n-- -{5,}\n\n/.exec(head);
+      if (!ok) { continue; }
+      var meta;
+      try { meta = JSON.parse(m[1]); } catch (e) { continue; }
+      if (!meta || typeof meta.path !== 'string') { continue; }
+      cuts.push({ start: after + ok[0].length, label: m.index,
+                  path: meta.path, cls: meta.class, tail: meta.tail || '',
+                  partial: !!meta.partial });
+    }
+    if (!cuts.length) { return null; }
+
+    var scripts = [], k;
+    for (k = 0; k < cuts.length; k++) {
+      var end;
+      if (k + 1 < cuts.length) {
+        end = cuts[k + 1].label - 2;              /* "body\n" + blank line */
+      } else {
+        var markers = ['\n-- @partial ', '\n-- unpacked in ', '\n-- ===== PARTIAL'];
+        end = text.length;
+        for (var q = 0; q < markers.length; q++) {
+          var at = text.indexOf(markers[q], cuts[k].start);
+          if (at >= 0 && at - 1 < end) { end = at - 1; }
+        }
+        while (end > cuts[k].start && text.charAt(end - 1) === '\n') { end--; }
+      }
+      if (end < cuts[k].start) { end = cuts[k].start; }
+      scripts.push({ path: cuts[k].path, cls: cuts[k].cls,
+                     body: text.slice(cuts[k].start, end) + cuts[k].tail });
+    }
+    return { scripts: scripts, partial: /-- @partial /.test(text) };
+  }
+
+  /* ------------------------------------------------ saving it ------------ */
   function b64ToBytes(b64) {
     var bin = atob(b64), n = bin.length, out = new Uint8Array(n);
     for (var i = 0; i < n; i++) { out[i] = bin.charCodeAt(i); }
     return out;
   }
-
   function saveBlob(blob, name) {
     var url = window.URL.createObjectURL(blob);
     var a = document.createElement('a');
-    a.href = url;
-    a.download = name;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
     window.setTimeout(function () { window.URL.revokeObjectURL(url); }, 4000);
   }
-
   function baseName(name) {
     return String(name || 'game')
       .replace(/\.(rbxlx|rbxl|rbxmx|rbxm|luauc|luac|lua)$/i, '')
       .replace(/[\\/]+$/, '') || 'game';
   }
 
-  /* Called before the page's own download. Returning true means the click is
-     handled here (the place file is fetched and saved a moment later). */
+  /* Called before the page's own download.  Returning true means the click is
+     handled here. */
   window.__oracleDownloadScripts = function (text, fileName, decompiler) {
     try {
       if (typeof text !== 'string') { return false; }
-      var m = text.match(/^-- @place (\{[^\n]*\})/m);
-      if (!m) { return false; }                  /* one script: the normal .lua */
-      var info = JSON.parse(m[1]);
-      var url = window.__ORACLE_ENGINE_URL;
-      if (!info || !info.id || !url) { return false; }
+      var doc = parseDocument(text);
+      if (!doc || !doc.scripts.length) { return false; }
+      if (doc.scripts.length < 2 && !doc.partial) { return false; }   /* one script -> .lua */
       var base = baseName(fileName);
-
-      fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-                   body: JSON.stringify({ oracle_build: { id: info.id } }) })
-        .then(function (r) { return r.text(); })
-        .then(function (b64) {
-          var bytes = null;
-          if (b64 && b64.charAt(0) !== '{' && b64.length % 4 === 0) {
-            try { bytes = b64ToBytes(b64); } catch (e) { bytes = null; }
-          }
-          /* the only thing worth saving is a Roblox binary file: <roblox! */
-          if (!bytes || bytes.length < 8 || bytes[0] !== 0x3C || bytes[1] !== 0x72 ||
-              bytes[2] !== 0x6F || bytes[3] !== 0x62 || bytes[4] !== 0x6C ||
-              bytes[5] !== 0x6F || bytes[6] !== 0x78 || bytes[7] !== 0x21) {
-            throw new Error('the engine could not rebuild the place');
-          }
-          saveBlob(new Blob([bytes], { type: 'application/octet-stream' }),
-                   base + '_decompiled.rbxl');
-        })
-        .catch(function (err) {
-          if (window.console && console.error) {
-            console.error('Oracle: could not build the .rbxl - saving the text file:', err);
-          }
-          saveBlob(new Blob([text], { type: 'text/plain;charset=utf-8' }),
-                   base + '_oracle.lua');
-        });
-      return true;
-    } catch (e) {
-      return false;
-    }
+      try {
+        var bytes = buildPlace(doc.scripts);
+        saveBlob(new Blob([bytes], { type: 'application/octet-stream' }),
+                 base + (doc.partial ? '_partial' : '') + '_decompiled.rbxl');
+        return true;
+      } catch (err) {
+        if (window.console && console.error) {
+          console.error('Oracle: building the .rbxl here failed, asking the engine:', err);
+        }
+      }
+      /* fallback 1: the engine still has the game and can send the file */
+      var place = /^-- @place (\{[^\n]*\})/m.exec(text);
+      var url = window.__ORACLE_ENGINE_URL;
+      if (place && url) {
+        var info = JSON.parse(place[1]);
+        fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                     body: JSON.stringify({ oracle_build: { id: info.id } }) })
+          .then(function (r) { return r.text(); })
+          .then(function (b64) { saveBlob(new Blob([b64ToBytes(b64)], { type: 'application/octet-stream' }),
+                                          base + '_decompiled.rbxl'); })
+          .catch(function () { saveBlob(new Blob([text], { type: 'text/plain;charset=utf-8' }),
+                                        base + '_oracle.lua'); });
+        return true;
+      }
+    } catch (e) { /* fall through to the page's own download */ }
+    return false;
   };
 })();
 </script>
