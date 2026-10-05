@@ -1316,6 +1316,19 @@ def _collect(instances, parents):
     return scripts, len(instances)
 
 
+def place_body(s):
+    """The text this script contributes to the .rbxl - defined once, used by the
+    document and by the place payload, so the page can rebuild the file from
+    the document alone (byte for byte)."""
+    if s['source']:
+        return s['source'].decode('utf-8', 'replace')
+    if s.get('decompiled'):
+        return s['decompiled']
+    if s['bytecode']:
+        return "-- (bytecode only - this script could not be decompiled)\n"
+    return "-- (empty script)\n"
+
+
 def render_document(name, scripts, instance_count, fmt, extract_dir=None, notes=(), place_id=None):
     """One document: a header, then every script with a separator comment."""
     have_src = sum(1 for s in scripts if s['source'].strip())
@@ -1349,16 +1362,15 @@ def render_document(name, scripts, instance_count, fmt, extract_dir=None, notes=
     shown = 0
     truncated = False
     for i, s in enumerate(scripts, 1):
-        body = s['source'].decode('utf-8', 'replace').rstrip('\r\n')
-        if not body.strip() and s['bytecode']:
-            body = s.get('decompiled') or ("-- (bytecode only - the decompiler engine did not "
-                                           "answer for this script)")
-        if not body.strip():
-            body = "-- (this script is empty in the file)"
-        # machine-readable label: the download button cuts the document into one
-        # .lua file per script on this line, so nothing has to parse the artwork
-        label = '-- @script {"path": %s, "class": %s, "index": %d}' % (
-            json.dumps(s['path']), json.dumps(s['class']), i)
+        full = place_body(s)
+        tail = full[len(full.rstrip('\r\n')):]          # trailing newlines
+        body = full[:len(full) - len(tail)] if tail else full
+        # machine-readable label: Download cuts the document into one file per
+        # script on this line, and "tail" lets it put the exact trailing
+        # newlines back, so the .rbxl it builds matches the game byte for byte
+        extra = ', "tail": %s' % json.dumps(tail) if tail else ''
+        label = '-- @script {"path": %s, "class": %s, "index": %d%s}' % (
+            json.dumps(s['path']), json.dumps(s['class']), i, extra)
         block = "\n%s\n-- %s\n-- %s   [%s]\n-- %s\n\n%s\n" % (
             label, "-" * 70, s['path'], s['class'], "-" * 70, body)
         if used + len(block) > MAX_OUTPUT:
@@ -1505,16 +1517,8 @@ def handle_place(raw, filename, decompile_one):
         place_id = "p" + os.urandom(5).hex()
         payload = []
         for s in scripts:
-            if s['source'].strip():
-                # exactly the text that was in the game - not a byte more
-                body = s['source'].decode('utf-8', 'replace')
-            elif s.get('decompiled'):
-                body = s['decompiled']
-            elif s['bytecode']:
-                body = "-- (bytecode only - this script could not be decompiled)\n"
-            else:
-                body = "-- (empty script)\n"
-            payload.append({"path": s['path'], "class": s['class'], "body": body})
+            payload.append({"path": s['path'], "class": s['class'],
+                            "body": place_body(s)})
         _PLACES[place_id] = {"name": filename, "scripts": payload, "ts": time.time()}
         try:
             tx_save("place", place_id, json.dumps(payload).encode("utf-8"))
