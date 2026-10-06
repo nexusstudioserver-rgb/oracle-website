@@ -1,3 +1,4 @@
+<!-- Oracle build 2026-10-06 10:08 - whole game on Download, any game, any name -->
 <!DOCTYPE html><html><head>
 <script>
 /* ===========================================================================
@@ -791,7 +792,11 @@
       .replace(/\.(rbxlx|rbxl|rbxmx|rbxm|luauc|luac|lua)$/i, '')
       .replace(/[\\/]+$/, '') || 'game';
   }
-  function suffix(kind) { return kind === 'rbxlx' ? '.rbxlx' : '.rbxl'; }
+  function suffix(kind) {
+    return kind === 'rbxlx' ? '.rbxlx' :
+           kind === 'rbxmx' ? '.rbxmx' :
+           kind === 'rbxm' ? '.rbxm' : '.rbxl';
+  }
 
   /* Called before the page's own download.  Returning true means the click is
      handled here. */
