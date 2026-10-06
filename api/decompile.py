@@ -1911,30 +1911,42 @@ def _collect(instances, parents):
 
 
 def place_body(s):
-    """The text this script contributes to the .rbxl - defined once, used by the
-    document and by the place payload, so the page can rebuild the file from
-    the document alone (byte for byte)."""
+    """The text this script contributes to the .rbxl and to the editor.
+
+    Defined once so the document, the extracted .lua files and the whole-game
+    file can never disagree: what you read on the site is exactly what lands in
+    the script when the game is opened in Studio.
+
+    Order: the decompiled code (whenever the engine produced some for this
+    script), then the file's own source text, then - only if there is neither -
+    a note saying what happened.  A script that shipped a protected/opaque source
+    string next to its compiled code therefore comes out as real code.
+    """
+    if s.get('ok') and s.get('decompiled'):
+        return s['decompiled']                      # the engine decompiled it
     if s['source']:
         return s['source'].decode('utf-8', 'replace')
     if s.get('decompiled'):
-        return s['decompiled']
+        return s['decompiled']                      # the note explaining the gap
     if s['bytecode']:
-        return "-- (bytecode only - this script could not be decompiled)\n"
+        return "-- (compiled only - this script could not be decompiled)\n"
     return "-- (empty script)\n"
 
 
 def render_document(name, scripts, instance_count, fmt, extract_dir=None, notes=(), place_id=None, full_info=None):
     """One document: a header, then every script with a separator comment."""
     have_src = sum(1 for s in scripts if s['source'].strip())
-    have_bc = sum(1 for s in scripts if not s['source'].strip() and s['bytecode'])
-    empty = len(scripts) - have_src - have_bc
+    have_bc = sum(1 for s in scripts if s['bytecode'])
+    decompiled = sum(1 for s in scripts if s.get('ok'))
+    empty = sum(1 for s in scripts if not s['source'].strip() and not s['bytecode'])
 
     head = [
         "-- " + "=" * 72,
         "-- Extracted from: %s   (%s format%s)" % (
             name, fmt, ", %d instances" % instance_count if instance_count else ""),
-        "-- Scripts found: %d   |   with source: %d   |   bytecode only: %d%s"
-        % (len(scripts), have_src, have_bc,
+        "-- Scripts found: %d   |   decompiled from compiled code: %d   |   "
+        "source text: %d%s"
+        % (len(scripts), decompiled, have_src,
            "   |   no data: %d" % empty if empty else ""),
     ]
     if place_id:
@@ -2044,10 +2056,13 @@ def handle_place(raw, filename, decompile_one):
         notes.append("If this is a place saved with protected scripts, their source "
                      "may not be stored.")
     # decompile the bytecode-only ones (in parallel - big places have hundreds)
-    bc_scripts = [s for s in scripts if not s['source'].strip() and s['bytecode']]
+    # Every script that carries compiled code gets decompiled - including the
+    # ones that also carry a source string, because a protected game keeps a
+    # junk (or stripped) source next to the real compiled script.
+    bc_scripts = [s for s in scripts if s['bytecode']]
     if bc_scripts:
         todo = bc_scripts[:MAX_SCRIPTS]
-        notes.append("Decompiling %d bytecode-only script(s)..." % len(todo))
+        notes.append("Decompiling %d compiled script(s)..." % len(todo))
 
         def _one(s):
             """One compiled chunk -> (decompiled text, why it failed).
@@ -2091,7 +2106,7 @@ def handle_place(raw, filename, decompile_one):
                 s['decompiled'] = (
                     "-- (bytecode only - this script could not be decompiled: %s.\n"
                     "--  Drop the file in again to retry just the missing ones.)" % why)
-        notes.append("Bytecode-only scripts decompiled: %d of %d." % (done, len(todo)))
+        notes.append("Scripts decompiled from compiled code: %d of %d." % (done, len(todo)))
         if done < len(todo):
             notes.append("%d script(s) still missing - the engine was busy or refused them."
                          % (len(todo) - done))
