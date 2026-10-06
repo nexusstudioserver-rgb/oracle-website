@@ -1167,6 +1167,225 @@ def _read_refs(buf, off, count):
     return vals, off + count * 4
 
 # ===========================================================================
+#  the whole game back: same place, decompiled sources
+# ---------------------------------------------------------------------------
+#  Keeps everything: models, parts, tools, GUIs, values - only the code changes.
+#  Chunks the translator does not touch are copied out of the original file
+#  byte for byte (never even decompressed), so nothing can be lost.
+# ===========================================================================
+import struct
+
+#  (uses _chunk / _ustr / lz4_decompress_block / zstd_decompress / check_binary_place)
+
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+END_NAME = b"END\x00"
+
+
+def _inflate(body, raw_len):
+    if body[:4] == ZSTD_MAGIC:
+        return _zstd(body, raw_len)
+    return lz4_decompress_block(body, raw_len)
+
+
+def _read_ustr(buf, off):
+    n = struct.unpack_from("<I", buf, off)[0]
+    return buf[off + 4:off + 4 + n], off + 4 + n
+
+
+def _read_refs(buf, off, count):
+    raw = bytearray(buf[off:off + count * 4])
+    out = bytearray(count * 4)
+    for w in range(4):
+        out[w::4] = raw[w * count:(w + 1) * count]
+    acc, vals = 0, []
+    for i in range(count):
+        v = struct.unpack_from(">i", out, i * 4)[0]
+        acc += (v >> 1) ^ -(v & 1)
+        vals.append(acc)
+    return vals, off + count * 4
+
+
+def _read_strings(buf, off, count):
+    vals = []
+    for _ in range(count):
+        s, off = _read_ustr(buf, off)
+        vals.append(s)
+    return vals, off
+
+
+def _zstd(body, raw_len):
+    """A ZSTD-compressed chunk body, inflated.
+
+    Inside the engine the decompressor is already in scope; on its own (the
+    tests import this file directly) it is borrowed from the api file.
+    """
+    try:
+        return zstd_decompress(body, max_output=raw_len)
+    except NameError:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "oracle_api", "/home/user/vercel-deploy/api/decompile.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.zstd_decompress(body, max_output=raw_len)
+
+
+def _plain_chunk(ch):
+    """A kept chunk as it must leave this module: LZ4 (or raw), never ZSTD.
+
+    Chunks that are not rewritten travel from the original file untouched, but
+    a chunk the game shipped compressed with ZSTD is inflated and re-emitted as
+    LZ4, so the place opens everywhere.
+    """
+    name, comp_len, raw_len, reserved, body, _parsed = ch
+    if comp_len and body[:4] == ZSTD_MAGIC:
+        inner = _zstd(body, raw_len)
+        if name == END_NAME:
+            return name + struct.pack("<III", 0, len(inner), reserved) + inner
+        comp = lz4_compress_block(inner)
+        return name + struct.pack("<III", len(comp), len(inner), 0) + comp
+    return name + struct.pack("<III", comp_len, raw_len, reserved) + body
+
+
+def edit_binary_place(data, texts):
+    """Same place, new script sources.  texts = {referent: text}."""
+    if data[:8] != b"<roblox!":
+        raise ValueError("not a Roblox binary place")
+    header = data[:32]
+
+    chunks = []                    # [name, comp_len, raw_len, reserved, body_bytes, parsed]
+    off, n = 32, len(data)
+    while off + 16 <= n:
+        name = data[off:off + 4]
+        comp_len, raw_len, reserved = struct.unpack_from("<III", data, off + 4)
+        off += 16
+        body = data[off:off + (comp_len or raw_len)]
+        off += (comp_len or raw_len)
+        chunks.append([name, comp_len, raw_len, reserved, body, None])
+        if name == END_NAME:
+            break
+
+    classes = {}                   # cid -> [class name, [refs]]
+    for ch in chunks:
+        if ch[0] != b"INST":
+            continue
+        inner = _inflate(ch[4], ch[2]) if ch[1] else ch[4]
+        cid = struct.unpack_from("<I", inner, 0)[0]
+        cname, p = _read_ustr(inner, 4)
+        p += 1                                             # object format
+        count = struct.unpack_from("<I", inner, p)[0]
+        p += 4
+        refs, _p = _read_refs(inner, p, count)
+        classes[cid] = [cname.decode("utf-8", "replace"), refs]
+
+    script_cids = set(cid for cid, (name, _r) in classes.items() if name in SCRIPT_CLASSES)
+
+    # which property chunks belong to script classes, and what they are
+    source_at = {}                 # cid -> chunk index holding "Source"
+    drop = set()                   # chunk indexes to leave out (old Bytecode)
+    for i, ch in enumerate(chunks):
+        if ch[0] != b"PROP" or not script_cids:
+            continue
+        inner = _inflate(ch[4], ch[2]) if ch[1] else ch[4]
+        cid = struct.unpack_from("<I", inner, 0)[0]
+        if cid not in script_cids:
+            continue
+        pname, _p = _read_ustr(inner, 4)
+        if pname == b"Source":
+            source_at[cid] = i
+        elif pname == b"Bytecode":
+            # the compiled original would fight with the text we are putting in,
+            # and the text is the whole point of the download: drop it
+            drop.add(i)
+
+    # rebuild the Source chunk of every script class
+    edited = {}
+    for cid, (cname, refs) in classes.items():
+        if cid not in script_cids:
+            continue
+        body = struct.pack("<I", cid) + _ustr("Source") + bytes([0x01])
+        for ref in refs:
+            text = texts.get(ref)
+            if text is None:
+                text = ""
+            body += _ustr(text)
+        edited[cid] = body
+
+    out = bytearray(header)
+    placed = set()
+    for i, ch in enumerate(chunks):
+        if i in drop:
+            continue
+        if ch[0] == b"PROP":
+            inner = _inflate(ch[4], ch[2]) if ch[1] else ch[4]
+            cid = struct.unpack_from("<I", inner, 0)[0]
+            if cid in edited and source_at.get(cid) == i:
+                out += _chunk(b"PROP", edited[cid])
+                placed.add(cid)
+                continue
+        if ch[0] == END_NAME:
+            # any script class that had no Source property gets one just before
+            # the parent chunk ends the file
+            for cid, body in edited.items():
+                if cid not in placed:
+                    out += _chunk(b"PROP", body)
+            out += _plain_chunk(ch)
+            break
+        if ch[0] not in (b"INST", b"PROP", b"PRNT"):
+            # this chunk travels from the original file, byte for byte
+            out += _plain_chunk(ch)
+            continue
+        if ch[0] == b"PRNT":
+            for cid, body in edited.items():
+                if cid not in placed:
+                    out += _chunk(b"PROP", body)
+            placed.update(edited)
+        out += _plain_chunk(ch)
+
+    result = bytes(out)
+    problems = check_binary_place(result)
+    if problems:
+        raise ValueError("the edited place would be rejected: " + "; ".join(problems))
+    return result
+
+
+def edit_xml_place(data, texts):
+    """The same idea for .rbxlx / .rbxmx files (text XML places)."""
+    import xml.etree.ElementTree as ET
+
+    def tag(el):
+        return el.tag.rsplit("}", 1)[-1]
+
+    root = ET.fromstring(data)
+
+    def walk(item):
+        for child in list(item):
+            if tag(child) != "Item":
+                continue
+            cls = child.get("class") or ""
+            if cls in SCRIPT_CLASSES:
+                props = None
+                for sub in child:
+                    if tag(sub) == "Properties":
+                        props = sub
+                if props is None:
+                    props = ET.SubElement(child, "Properties")
+                for sub in list(props):
+                    if sub.get("name") == "Bytecode":            # same reasoning as above
+                        props.remove(sub)
+                # one Source per place, so remove any duplicates first
+                for sub in list(props):
+                    if sub.get("name") == "Source":
+                        props.remove(sub)
+                src = ET.SubElement(props, "ProtectedString")
+                src.set("name", "Source")
+                src.text = texts.get(child.get("referent") or "", "")
+            walk(child)
+
+    walk(root)
+    return ET.tostring(root, encoding="utf-8", xml_declaration=False)
+
+# ===========================================================================
 #  Roblox binary place/model  ->  list of scripts
 # ===========================================================================
 def parse_binary_place(data):
@@ -1276,6 +1495,7 @@ def parse_xml_place(data):
                     'class': cls,
                     'source': src.encode('utf-8', 'replace'),
                     'bytecode': base64.b64decode(bc) if bc else b'',
+                    'ref': child.get('referent') or '',
                 })
             walk(child, here)
 
@@ -1311,7 +1531,7 @@ def _collect(instances, parents):
         src = inst['props'].get('Source') or b''
         bc = inst['props'].get('Bytecode') or b''
         scripts.append({'path': '/'.join(parts), 'class': inst['class'],
-                        'source': src, 'bytecode': bc})
+                        'source': src, 'bytecode': bc, 'ref': ref})
     scripts.sort(key=lambda s: (s['path'], s['class']))
     return scripts, len(instances)
 
@@ -1329,7 +1549,7 @@ def place_body(s):
     return "-- (empty script)\n"
 
 
-def render_document(name, scripts, instance_count, fmt, extract_dir=None, notes=(), place_id=None):
+def render_document(name, scripts, instance_count, fmt, extract_dir=None, notes=(), place_id=None, full_info=None):
     """One document: a header, then every script with a separator comment."""
     have_src = sum(1 for s in scripts if s['source'].strip())
     have_bc = sum(1 for s in scripts if not s['source'].strip() and s['bytecode'])
@@ -1344,10 +1564,13 @@ def render_document(name, scripts, instance_count, fmt, extract_dir=None, notes=
            "   |   no data: %d" % empty if empty else ""),
     ]
     if place_id:
-        # the page reads this line: Download asks the engine for this id and gets
-        # the whole game back as a .rbxl
+        # the page reads these lines: Download asks the engine for this id and
+        # gets the whole game back (-- @fullplace), or the scripts and their
+        # folders if the original file could not be rebuilt
         head.append('-- @place %s' % json.dumps({"id": place_id, "name": name,
                                                  "scripts": len(scripts)}))
+        if full_info:
+            head.append('-- @fullplace %s' % json.dumps(full_info))
     if extract_dir:
         head.append("-- Also written to: %s" % extract_dir)
     head.append("-- Note: source that was still stored in the file is shown as-is;")
@@ -1516,16 +1739,37 @@ def handle_place(raw, filename, decompile_one):
     if scripts:
         place_id = "p" + os.urandom(5).hex()
         payload = []
+        texts = {}
         for s in scripts:
-            payload.append({"path": s['path'], "class": s['class'],
-                            "body": place_body(s)})
-        _PLACES[place_id] = {"name": filename, "scripts": payload, "ts": time.time()}
+            text = place_body(s)
+            payload.append({"path": s['path'], "class": s['class'], "body": text})
+            if s.get('ref') is not None:
+                texts[s['ref']] = text
+        record = {"name": filename, "scripts": payload, "ts": time.time()}
+        # the whole game: every instance kept, the script sources swapped
+        try:
+            if fmt == 'binary':
+                record["full"] = edit_binary_place(raw, texts)
+                record["fullkind"] = "rbxl"
+            else:
+                record["full"] = edit_xml_place(raw, texts)
+                record["fullkind"] = "rbxlx"
+        except Exception as exc:
+            notes.append("Could not rebuild the whole game (%s); the .rbxl will hold " 
+                         "the scripts and their folders." % exc)
+        _PLACES[place_id] = record
         try:
             tx_save("place", place_id, json.dumps(payload).encode("utf-8"))
+            if record.get("full"):
+                tx_save("fullplace", place_id, record["full"])
         except Exception:
             pass
 
-    doc = render_document(filename, scripts, count, fmt, extract_dir, notes, place_id)
+    full_info = None
+    if place_id and _PLACES.get(place_id, {}).get("full"):
+        full_info = {"id": place_id, "bytes": len(_PLACES[place_id]["full"]),
+                     "name": filename, "kind": _PLACES[place_id].get("fullkind", "rbxl")}
+    doc = render_document(filename, scripts, count, fmt, extract_dir, notes, place_id, full_info)
     doc += "\n-- unpacked in %.2fs\n" % (time.time() - t0)
     return doc
 
@@ -1743,7 +1987,13 @@ class handler(BaseHTTPRequestHandler):
             return
 
         try:
-            blob = build_binary_place(record["scripts"])
+            full = record.get("full")
+            if full is None:                      # the instance may have restarted
+                blob = tx_load("fullplace", pid)
+                if blob is not None:
+                    full = blob
+            blob = full if full else build_binary_place(record["scripts"])
+            is_full = bool(full)
             # last line of defence: if the file breaks any rule Studio checks,
             # say so instead of handing over a place that opens empty
             problems = check_binary_place(blob)
@@ -1762,7 +2012,8 @@ class handler(BaseHTTPRequestHandler):
         _RESULTS[tid] = {"parts": parts, "filename": record.get("name") or "game",
                          "ts": time.time()}
         tx_save("result", tid, b64.encode("ascii"))
-        self._reply(200, json.dumps({"ok": True,
+        self._reply(200, json.dumps({"ok": True, "full": is_full,
+                                     "kind": record.get("fullkind", "rbxl") if is_full else "rbxl",
                                      "result": {"id": tid, "parts": len(parts),
                                                 "bytes": len(blob)}}),
                     "application/json")
