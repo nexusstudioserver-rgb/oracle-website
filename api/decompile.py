@@ -1175,10 +1175,36 @@ def _read_refs(buf, off, count):
 # ===========================================================================
 import struct
 
-#  (uses _chunk / _ustr / lz4_decompress_block / zstd_decompress / check_binary_place)
+#  (uses _chunk / _ustr / lz4_decompress_block / lz4_compress_block /
+#   zstd_decompress / check_binary_place from the writer above)
+
+
+try:                                     # inside oracle_server.py these are in scope already
+    from rbxl_write import (lz4_compress_block, lz4_decompress_block, _chunk, _ustr,
+                            check_binary_place)
+except ImportError:                      # pragma: no cover
+    pass
 
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+SCRIPT_CLASSES = ("Script", "LocalScript", "ModuleScript")
 END_NAME = b"END\x00"
+
+
+def _zstd(body, raw_len):
+    """A ZSTD-compressed chunk body, inflated.
+
+    Inside the engine the decompressor is already in scope; on its own (the
+    tests import this file directly) it is borrowed from the api file.
+    """
+    try:
+        return zstd_decompress(body, max_output=raw_len)
+    except NameError:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "oracle_api", "/home/user/vercel-deploy/api/decompile.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.zstd_decompress(body, max_output=raw_len)
 
 
 def _inflate(body, raw_len):
@@ -1213,23 +1239,6 @@ def _read_strings(buf, off, count):
     return vals, off
 
 
-def _zstd(body, raw_len):
-    """A ZSTD-compressed chunk body, inflated.
-
-    Inside the engine the decompressor is already in scope; on its own (the
-    tests import this file directly) it is borrowed from the api file.
-    """
-    try:
-        return zstd_decompress(body, max_output=raw_len)
-    except NameError:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "oracle_api", "/home/user/vercel-deploy/api/decompile.py")
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod.zstd_decompress(body, max_output=raw_len)
-
-
 def _plain_chunk(ch):
     """A kept chunk as it must leave this module: LZ4 (or raw), never ZSTD.
 
@@ -1247,143 +1256,508 @@ def _plain_chunk(ch):
     return name + struct.pack("<III", comp_len, raw_len, reserved) + body
 
 
-def edit_binary_place(data, texts):
-    """Same place, new script sources.  texts = {referent: text}."""
-    if data[:8] != b"<roblox!":
-        raise ValueError("not a Roblox binary place")
-    header = data[:32]
+def read_chunks(data):
+    """[name, comp_len, raw_len, reserved, body] for every chunk, in order.
 
-    chunks = []                    # [name, comp_len, raw_len, reserved, body_bytes, parsed]
-    off, n = 32, len(data)
+    Returns (chunks, None) when the framing is sound, (partial, why) when it is
+    not - a place whose chunk headers do not add up is never handed out.
+    """
+    if data[:8] != b"<roblox!":
+        return [], "not a Roblox binary file"
+    chunks, off, n = [], 32, len(data)
     while off + 16 <= n:
         name = data[off:off + 4]
         comp_len, raw_len, reserved = struct.unpack_from("<III", data, off + 4)
         off += 16
-        body = data[off:off + (comp_len or raw_len)]
-        off += (comp_len or raw_len)
+        size = comp_len or raw_len
+        body = data[off:off + size]
+        if len(body) != size:
+            return chunks, "the %s chunk is cut short" % name.rstrip(b"\x00").decode("latin1")
+        off += size
         chunks.append([name, comp_len, raw_len, reserved, body, None])
         if name == END_NAME:
             break
+    return chunks, None
 
-    classes = {}                   # cid -> [class name, [refs]]
+
+def _classes_of(chunks):
+    """cid -> (class name, [referents]) from the INST chunks."""
+    classes = {}
     for ch in chunks:
         if ch[0] != b"INST":
             continue
-        inner = _inflate(ch[4], ch[2]) if ch[1] else ch[4]
-        cid = struct.unpack_from("<I", inner, 0)[0]
-        cname, p = _read_ustr(inner, 4)
-        p += 1                                             # object format
-        count = struct.unpack_from("<I", inner, p)[0]
-        p += 4
-        refs, _p = _read_refs(inner, p, count)
-        classes[cid] = [cname.decode("utf-8", "replace"), refs]
+        try:
+            inner = _inflate(ch[4], ch[2]) if ch[1] else ch[4]
+            cid = struct.unpack_from("<I", inner, 0)[0]
+            cname, p = _read_ustr(inner, 4)
+            p += 1                                             # object format byte
+            count = struct.unpack_from("<I", inner, p)[0]
+            p += 4
+            refs, _p = _read_refs(inner, p, count)
+        except Exception:
+            continue
+        classes[cid] = (cname.decode("utf-8", "replace"), refs)
+    return classes
 
+
+def _prop_name(chunk, classes):
+    """(cid, property name) for a PROP chunk, or (None, None)."""
+    if chunk[0] != b"PROP":
+        return None, None
+    try:
+        inner = _inflate(chunk[4], chunk[2]) if chunk[1] else chunk[4]
+        cid = struct.unpack_from("<I", inner, 0)[0]
+        pname, _p = _read_ustr(inner, 4)
+    except Exception:
+        return None, None
+    return cid, pname.decode("latin1")
+
+
+def _prop_values(chunk, classes, cid):
+    """The strings of a Source/Bytecode PROP chunk, one per instance."""
+    inner = _inflate(chunk[4], chunk[2]) if chunk[1] else chunk[4]
+    pname, p = _read_ustr(inner, 4)
+    p += 1                                                     # data type byte
+    return _read_strings(inner, p, len(classes[cid][1]))[0]
+
+
+def normalize_framing(data):
+    """The framing rules Studio writes places with, applied to a file that came
+    in loose.
+
+    Plenty of real game files (exports, conversions, older tools) number their
+    instances 1..N, count one instance more than they write, point the
+    top-level instances at a DataModel they never wrote, or end with an empty
+    END chunk.  Studio and rbx-dom both refuse those ("Invalid id 7487/7487"),
+    while the decompiler reads them fine - so the whole-game copy is framed the
+    way Studio does it:
+
+      * referents renumbered densely 0..N-1, keeping the file's own order,
+      * top-level instances get "no parent" (-1) instead of a missing referent,
+      * the header counts the instances that are really there,
+      * an END chunk without </roblox> gets it.
+
+    Returns (bytes, fixes, mapping).  A place that is already Studio-shaped
+    comes back unchanged, byte for byte, with no fixes and no mapping - so a
+    normal file is never touched.  `mapping` says which old referent became
+    which new one (empty when nothing was renumbered).
+    """
+    chunks, problem = read_chunks(data)
+    if problem or not chunks or chunks[-1][0] != END_NAME:
+        return data, [], {}
+    insts, order = [], []
+    for i, ch in enumerate(chunks):
+        if ch[0] != b"INST":
+            continue
+        try:
+            inner = _inflate(ch[4], ch[2]) if ch[1] else ch[4]
+            cid = struct.unpack_from("<I", inner, 0)[0]
+            cname, p = _read_ustr(inner, 4)
+            fmt = inner[p]
+            p += 1
+            count = struct.unpack_from("<I", inner, p)[0]
+            p += 4
+            refs, _p = _read_refs(inner, p, count)
+        except Exception:
+            return data, [], {}
+        insts.append([i, cid, cname, fmt, refs])
+        order.extend(refs)
+    if not order or len(set(order)) != len(order):
+        return data, [], {}                    # nothing to do, or already broken
+
+    want = list(range(len(order)))
+    mapping = {}
+    if sorted(order) != want:
+        mapping = {}
+        for old, new in zip(order, want):
+            mapping[old] = new
+
+    fixes = []
+    out = bytearray(struct.pack("<i", len(order)) if False else data[:32])
+    if struct.unpack_from("<i", out, 20)[0] != len(order):
+        struct.pack_into("<i", out, 20, len(order))
+        fixes.append("the instance count in the header")
+
+    by_index = {i: inst for inst, i in ((x, x[0]) for x in insts)}
+    for i, ch in enumerate(chunks):
+        name, comp_len, raw_len, reserved, body, _parsed = ch
+        if name == b"INST":
+            inst = by_index.get(i)
+            if inst and (mapping or False):
+                _i, cid, cname, fmt, refs = inst
+                payload = (struct.pack("<I", cid) + _ustr(cname) + bytes([fmt])
+                           + struct.pack("<I", len(refs))
+                           + _referents([mapping.get(r, r) for r in refs]))
+                out += _chunk(b"INST", payload)
+                continue
+        elif name == b"PRNT":
+            inner = _inflate(body, raw_len) if comp_len else body
+            p = 1
+            kcount = struct.unpack_from("<I", inner, p)[0]
+            p += 4
+            kids, p = _read_refs(inner, p, kcount)
+            pars, p = _read_refs(inner, p, kcount)
+            new_kids = [mapping.get(k, k) for k in kids] if mapping else kids
+            new_pars = []
+            lost = False
+            for par in pars:
+                if par == -1:
+                    new_pars.append(-1)
+                elif par in mapping:
+                    new_pars.append(mapping[par])
+                elif mapping:
+                    new_pars.append(-1)          # a parent that is not in the file
+                    lost = True
+                else:
+                    new_pars.append(par)
+                    lost = True
+            if mapping or lost:
+                payload = (b"\x00" + struct.pack("<I", kcount) + _referents(new_kids)
+                           + _referents(new_pars))
+                out += _chunk(b"PRNT", payload)
+                if mapping:
+                    fixes.append("the instance numbers (renumbered 0..%d)" % (len(order) - 1))
+                if lost:
+                    fixes.append("the parent of the top-level instances")
+                continue
+        elif name == END_NAME:
+            raw_end = b"</roblox>"
+            inner = _inflate(body, raw_len) if comp_len else body
+            if inner != raw_end:
+                out += name + struct.pack("<III", 0, len(raw_end), reserved) + raw_end
+                fixes.append("the END chunk")
+                continue
+        out += _plain_chunk(ch)
+
+    if not fixes and not mapping:
+        return data, [], {}
+    return bytes(out), fixes, mapping
+
+
+def edit_binary_place(data, texts):
+    """The same place, with the sources in `texts` written into it.
+
+    A file that came in loose (see `normalize_framing`) is framed the way Studio
+    writes places on the way out, so what you get back opens there.
+    """
+    base, framing_fixes, mapping = normalize_framing(data)
+    if mapping:
+        # the file's instances were renumbered on the way to Studio's framing,
+        # so the referents the caller used have to follow
+        texts = {mapping.get(k, k): v for k, v in texts.items()}
+    data = base
+    chunks, problem = read_chunks(data)
+    if problem:
+        raise ValueError(problem)
+    if not chunks or chunks[-1][0] != END_NAME:
+        raise ValueError("this file has no closing END chunk")
+
+    classes = _classes_of(chunks)
     script_cids = set(cid for cid, (name, _r) in classes.items() if name in SCRIPT_CLASSES)
 
-    # which property chunks belong to script classes, and what they are
-    source_at = {}                 # cid -> chunk index holding "Source"
-    drop = set()                   # chunk indexes to leave out (old Bytecode)
+    # which chunks hold a script class's Source / Bytecode, and what is in them
+    source_at, bytecode_at, old_values = {}, {}, {}
     for i, ch in enumerate(chunks):
-        if ch[0] != b"PROP" or not script_cids:
-            continue
-        inner = _inflate(ch[4], ch[2]) if ch[1] else ch[4]
-        cid = struct.unpack_from("<I", inner, 0)[0]
+        cid, pname = _prop_name(ch, classes)
         if cid not in script_cids:
             continue
-        pname, _p = _read_ustr(inner, 4)
-        if pname == b"Source":
+        if pname == "Source":
             source_at[cid] = i
-        elif pname == b"Bytecode":
-            # the compiled original would fight with the text we are putting in,
-            # and the text is the whole point of the download: drop it
-            drop.add(i)
+            old_values[cid] = _prop_values(ch, classes, cid)
+        elif pname == "Bytecode":
+            bytecode_at[cid] = i
 
-    # rebuild the Source chunk of every script class
-    edited = {}
-    for cid, (cname, refs) in classes.items():
-        if cid not in script_cids:
+    # the plan: per script class, what each instance's source becomes.  A script
+    # with no new text keeps exactly what it had, and keeps its Bytecode too.
+    plan = {}
+    for cid in script_cids:
+        refs = classes[cid][1]
+        if not any(ref in texts for ref in refs):
             continue
-        body = struct.pack("<I", cid) + _ustr("Source") + bytes([0x01])
-        for ref in refs:
-            text = texts.get(ref)
-            if text is None:
-                text = ""
-            body += _ustr(text)
-        edited[cid] = body
+        olds = old_values.get(cid) or [b""] * len(refs)
+        if len(olds) < len(refs):
+            olds = olds + [b""] * (len(refs) - len(olds))
+        values = []
+        for ref, old in zip(refs, olds):
+            new = texts.get(ref)
+            values.append(new.encode("utf-8") if isinstance(new, str) else (new if new is not None else old))
+        plan[cid] = values
 
-    out = bytearray(header)
+    def source_chunk(cid):
+        body = struct.pack("<I", cid) + _ustr("Source") + bytes([0x01])
+        for value in plan[cid]:
+            body += _ustr(value)
+        return _chunk(b"PROP", body)
+
+    drop = set()
+    for cid, values in plan.items():
+        refs = classes[cid][1]
+        if all(ref in texts for ref in refs) and cid in bytecode_at:
+            drop.add(bytecode_at[cid])                         # fully replaced: no stale bytecode
+
+    out = bytearray(data[:32])
     placed = set()
     for i, ch in enumerate(chunks):
         if i in drop:
             continue
-        if ch[0] == b"PROP":
-            inner = _inflate(ch[4], ch[2]) if ch[1] else ch[4]
-            cid = struct.unpack_from("<I", inner, 0)[0]
-            if cid in edited and source_at.get(cid) == i:
-                out += _chunk(b"PROP", edited[cid])
-                placed.add(cid)
-                continue
+        cid, pname = _prop_name(ch, classes)
+        if cid in plan and pname == "Source" and source_at.get(cid) == i:
+            out += source_chunk(cid)
+            placed.add(cid)
+            continue
         if ch[0] == END_NAME:
-            # any script class that had no Source property gets one just before
-            # the parent chunk ends the file
-            for cid, body in edited.items():
+            for cid in plan:
                 if cid not in placed:
-                    out += _chunk(b"PROP", body)
+                    out += source_chunk(cid)
             out += _plain_chunk(ch)
             break
         if ch[0] not in (b"INST", b"PROP", b"PRNT"):
-            # this chunk travels from the original file, byte for byte
-            out += _plain_chunk(ch)
+            out += _plain_chunk(ch)                            # travels untouched
             continue
         if ch[0] == b"PRNT":
-            for cid, body in edited.items():
+            for cid in plan:
                 if cid not in placed:
-                    out += _chunk(b"PROP", body)
-            placed.update(edited)
+                    out += source_chunk(cid)
+            placed.update(plan)
         out += _plain_chunk(ch)
 
     result = bytes(out)
-    problems = check_binary_place(result)
+    problems = check_edit(data, result, texts)
     if problems:
-        raise ValueError("the edited place would be rejected: " + "; ".join(problems))
+        raise ValueError("the edited place would be rejected: " + "; ".join(problems[:4]))
     return result
 
 
+def check_edit(original, edited, texts):
+    """The edited place against the file it came from.  Returns problems.
+
+    This is the promise the whole-game download makes, checked rather than
+    assumed: same header, the same chunks in the same order (except the compiled
+    Bytecode of the scripts that were replaced), the same content everywhere
+    except the script sources - and those only where new text was supplied.
+    """
+    problems = []
+    if original[:32] != edited[:32]:
+        problems.append("the file header changed")
+    achunks, why_a = read_chunks(original)
+    bchunks, why_b = read_chunks(edited)
+    if why_a:
+        problems.append("the original file could not be read (%s)" % why_a)
+        return problems
+    if why_b:
+        problems.append("the edited file could not be read (%s)" % why_b)
+        return problems
+    if not bchunks or bchunks[-1][0] != END_NAME:
+        problems.append("the edited file lost its END chunk")
+        return problems
+    classes = _classes_of(achunks)
+    script_cids = set(cid for cid, (name, _r) in classes.items() if name in SCRIPT_CLASSES)
+
+    def is_source(ch):
+        cid, pname = _prop_name(ch, classes)
+        return pname == "Source" and cid in script_cids
+
+    def is_bytecode(ch):
+        cid, pname = _prop_name(ch, classes)
+        return pname == "Bytecode" and cid in script_cids
+
+    def same_chunk(a, b):
+        """The same chunk?  ZSTD chunks are re-emitted as LZ4, so compare the
+        content, never the compressed bytes."""
+        if a[0] != b[0]:
+            return False
+        if not a[1] and not b[1]:
+            return a[4] == b[4]
+        try:
+            return _inflate(a[4], a[2]) == _inflate(b[4], b[2])
+        except Exception:
+            return False
+
+    # what a script class was, and what it must be now
+    replaced = {}
+    for cid in script_cids:
+        refs = classes[cid][1]
+        if any(ref in texts for ref in refs):
+            replaced[cid] = refs
+    dropped = set()
+    for i, ch in enumerate(achunks):
+        cid, pname = _prop_name(ch, classes)
+        if pname == "Bytecode" and cid in replaced and all(r in texts for r in replaced[cid]):
+            dropped.add(i)
+
+    expected = [ch for i, ch in enumerate(achunks) if i not in dropped]
+    if len(expected) != len(bchunks):
+        problems.append("the copy has %d chunks, the original's %d (minus %d dropped) - "
+                        "something was dropped or added"
+                        % (len(bchunks), len(achunks), len(dropped)))
+        return problems
+    for a, b in zip(expected, bchunks):
+        if is_source(a) and is_source(b):
+            if a[0] != b[0] or _prop_name(a, classes)[0] != _prop_name(b, classes)[0]:
+                problems.append("two Source chunks ended up swapped")
+                break
+            continue
+        if not same_chunk(a, b):
+            problems.append("the %s chunk does not match the original"
+                            % a[0].rstrip(b"\x00").decode("latin1"))
+            break
+
+    # what is inside every Source chunk must be exactly what was meant
+    for ch in bchunks:
+        cid, pname = _prop_name(ch, classes)
+        if pname != "Source" or cid not in script_cids:
+            continue
+        refs = classes[cid][1]
+        try:
+            values = _prop_values(ch, classes, cid)
+        except Exception as exc:
+            problems.append("the Source chunk of %s cannot be read (%s)"
+                            % (classes[cid][0], exc))
+            continue
+        if len(values) != len(refs):
+            problems.append("%s has %d sources for %d instances"
+                            % (classes[cid][0], len(values), len(refs)))
+            continue
+        for ref, value in zip(refs, values):
+            want = texts.get(ref)
+            if want is None:
+                continue
+            want = want.encode("utf-8") if isinstance(want, str) else want
+            if value != want:
+                problems.append("the source of %s did not land in the copy" % classes[cid][0])
+                break
+
+    # when the original was a file Studio would open, the copy must be one too
+    if not check_binary_place(original):
+        problems.extend(check_binary_place(edited))
+    return problems
+
+
 def edit_xml_place(data, texts):
-    """The same idea for .rbxlx / .rbxmx files (text XML places)."""
+    """The same idea for .rbxlx / .rbxmx files (text XML places).
+
+    A script is rewritten only when there IS new text for it; every other item
+    and property is left exactly as it was, and the result is re-read before it
+    is handed over (see `check_xml_edit`).
+    """
     import xml.etree.ElementTree as ET
 
     def tag(el):
         return el.tag.rsplit("}", 1)[-1]
 
-    root = ET.fromstring(data)
+    text = data.decode("utf-8", "replace")
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as exc:
+        raise ValueError("this XML file could not be read (%s)" % exc)
+    if tag(root) != "roblox":
+        raise ValueError("not a Roblox XML file")
+
+    written = set()
+    walked = set()
 
     def walk(item):
+        ref = item.get("referent") or ""
+        cls = item.get("class") or ""
+        props = None
+        for child in item:
+            if tag(child) == "Properties":
+                props = child
+                break
+        if props is not None and cls in SCRIPT_CLASSES and ref in texts:
+            new = texts[ref]
+            new = new if isinstance(new, str) else new.decode("utf-8", "replace")
+            # exactly one Source, and no stale Bytecode
+            for sub in list(props):
+                if sub.get("name") == "Source":
+                    props.remove(sub)
+                elif sub.get("name") == "Bytecode":
+                    props.remove(sub)
+            src = ET.SubElement(props, "ProtectedString")
+            src.set("name", "Source")
+            src.text = new
+            written.add(ref)
+        walked.add(ref)
         for child in list(item):
-            if tag(child) != "Item":
-                continue
-            cls = child.get("class") or ""
-            if cls in SCRIPT_CLASSES:
-                props = None
-                for sub in child:
-                    if tag(sub) == "Properties":
-                        props = sub
-                if props is None:
-                    props = ET.SubElement(child, "Properties")
-                for sub in list(props):
-                    if sub.get("name") == "Bytecode":            # same reasoning as above
-                        props.remove(sub)
-                # one Source per place, so remove any duplicates first
-                for sub in list(props):
-                    if sub.get("name") == "Source":
-                        props.remove(sub)
-                src = ET.SubElement(props, "ProtectedString")
-                src.set("name", "Source")
-                src.text = texts.get(child.get("referent") or "", "")
             walk(child)
 
-    walk(root)
-    return ET.tostring(root, encoding="utf-8", xml_declaration=False)
+    for child in list(root):
+        walk(child)
+
+    missing = [r for r in texts if r not in written]
+    if missing and not walked.issuperset(missing):
+        raise ValueError("%d script(s) could not be found in the XML file" % len(missing))
+
+    # no <?xml ...?> line: Studio and rbx-dom both want the file to start with
+    # <roblox
+    result = ET.tostring(root, encoding="utf-8", xml_declaration=False)
+    problems = check_xml_edit(data, result, texts)
+    if problems:
+        raise ValueError("the edited place would be rejected: " + "; ".join(problems[:4]))
+    return result
+
+
+def check_xml_edit(original, edited, texts):
+    """The XML copy against the file it came from: same items, same properties,
+    the new source exactly where it was meant to go."""
+    import xml.etree.ElementTree as ET
+
+    def tag(el):
+        return el.tag.rsplit("}", 1)[-1]
+
+    def flat(data):
+        root = ET.fromstring(data.decode("utf-8", "replace"))
+        out = []
+
+        def walk(item, path):
+            cls = item.get("class") or ""
+            props = {}
+            for child in item:
+                if tag(child) == "Properties":
+                    for prop in child:
+                        props[prop.get("name")] = (tag(prop), prop.text or "")
+            out.append((path, cls, props, item.get("referent") or ""))
+            for i, child in enumerate(item):
+                if tag(child) == "Item":
+                    name = props.get("Name", ("", ""))[1] or "Item"
+                    walk(child, path + "/" + name)
+
+        for child in list(root):
+            walk(child, "")
+        return out
+
+    problems = []
+    try:
+        a = flat(original)
+        b = flat(edited)
+    except Exception as exc:
+        return ["the XML copy cannot be read back (%s)" % exc]
+    if len(a) != len(b):
+        problems.append("%d items went in, %d came out" % (len(a), len(b)))
+        return problems
+    for (pa, ca, props_a, ra), (pb, cb, props_b, rb) in zip(a, b):
+        if ca != cb or ra != rb:
+            problems.append("item %r changed class or referent" % pa)
+            continue
+        replaced = ra in texts or rb in texts
+        skip = ("Source", "Bytecode") if replaced else ()
+        keys_a = {k for k in props_a if k not in skip}
+        keys_b = {k for k in props_b if k not in skip}
+        if keys_a != keys_b:
+            problems.append("item %r lost or gained a property" % pa)
+            continue
+        for k in keys_a:
+            if props_a[k] != props_b[k]:
+                problems.append("item %r's %s changed" % (pa, k))
+        want = texts.get(ra)
+        if want is not None:
+            want = want if isinstance(want, str) else want.decode("utf-8", "replace")
+            got = props_b.get("Source", ("", ""))[1]
+            if got != want:
+                problems.append("the source of %r did not land in the copy" % pa)
+        elif props_b.get("Source", ("", ""))[1] != props_a.get("Source", ("", ""))[1]:
+            problems.append("the source of %r changed although it was not replaced" % pa)
+    return problems
 
 # ===========================================================================
 #  Roblox binary place/model  ->  list of scripts
@@ -1710,8 +2084,10 @@ def handle_place(raw, filename, decompile_one):
         for s, text, why in zip(todo, texts, whys):
             if text:
                 s['decompiled'] = text
+                s['ok'] = True
                 done += 1
             else:
+                s['ok'] = False
                 s['decompiled'] = (
                     "-- (bytecode only - this script could not be decompiled: %s.\n"
                     "--  Drop the file in again to retry just the missing ones.)" % why)
@@ -1740,23 +2116,34 @@ def handle_place(raw, filename, decompile_one):
         place_id = "p" + os.urandom(5).hex()
         payload = []
         texts = {}
+        kept = 0
         for s in scripts:
             text = place_body(s)
             payload.append({"path": s['path'], "class": s['class'], "body": text})
             if s.get('ref') is not None:
-                texts[s['ref']] = text
+                # A script the engine could not answer is NOT blanked in the
+                # whole game: it keeps its own code (and its Bytecode), so the
+                # rest of a big game still runs.
+                if s.get('ok', True):
+                    texts[s['ref']] = text
+                else:
+                    kept += 1
         record = {"name": filename, "scripts": payload, "ts": time.time()}
         # the whole game: every instance kept, the script sources swapped
         try:
+            ext = os.path.splitext(filename or "")[1].lower()
             if fmt == 'binary':
                 record["full"] = edit_binary_place(raw, texts)
-                record["fullkind"] = "rbxl"
+                record["fullkind"] = {"rbxm": "rbxm", "rbxmx": "rbxmx"}.get(ext.lstrip("."), "rbxl")
             else:
                 record["full"] = edit_xml_place(raw, texts)
-                record["fullkind"] = "rbxlx"
+                record["fullkind"] = "rbxmx" if ext == ".rbxmx" else "rbxlx"
         except Exception as exc:
             notes.append("Could not rebuild the whole game (%s); the .rbxl will hold " 
                          "the scripts and their folders." % exc)
+        if kept:
+            notes.append("Kept the original code of %d script(s) the engine did not "
+                         "answer - the whole-game file has no empty scripts." % kept)
         _PLACES[place_id] = record
         try:
             tx_save("place", place_id, json.dumps(payload).encode("utf-8"))
@@ -1994,11 +2381,26 @@ class handler(BaseHTTPRequestHandler):
                     full = blob
             blob = full if full else build_binary_place(record["scripts"])
             is_full = bool(full)
-            # last line of defence: if the file breaks any rule Studio checks,
-            # say so instead of handing over a place that opens empty
-            problems = check_binary_place(blob)
-            if problems:
-                raise ValueError("; ".join(problems[:3]))
+            kind = record.get("fullkind", "rbxl") if is_full else "rbxl"
+            # Last line of defence.  A whole game was already checked against
+            # the file it came from (see check_edit) - here we only make sure
+            # the blob is intact, so an unusual-but-real game is never refused.
+            if is_full and kind != "rbxl":
+                import xml.etree.ElementTree as _ET
+                try:
+                    _ET.fromstring(blob.decode("utf-8", "replace"))
+                except Exception as exc:
+                    raise ValueError("the XML place does not read back (%s)" % exc)
+            elif is_full:
+                chunks, why = read_chunks(blob)
+                if why:
+                    raise ValueError(why)
+                if not chunks or chunks[-1][0] != b"END\x00":
+                    raise ValueError("the place has no closing END chunk")
+            else:
+                problems = check_binary_place(blob)
+                if problems:
+                    raise ValueError("; ".join(problems[:3]))
         except Exception as exc:
             self._reply(200, json.dumps({"ok": False,
                                          "error": "could not build the place file: %s" % exc}),
@@ -2012,8 +2414,7 @@ class handler(BaseHTTPRequestHandler):
         _RESULTS[tid] = {"parts": parts, "filename": record.get("name") or "game",
                          "ts": time.time()}
         tx_save("result", tid, b64.encode("ascii"))
-        self._reply(200, json.dumps({"ok": True, "full": is_full,
-                                     "kind": record.get("fullkind", "rbxl") if is_full else "rbxl",
+        self._reply(200, json.dumps({"ok": True, "full": is_full, "kind": kind,
                                      "result": {"id": tid, "parts": len(parts),
                                                 "bytes": len(blob)}}),
                     "application/json")
