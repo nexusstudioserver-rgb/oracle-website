@@ -34,6 +34,7 @@ TIMEOUT = 120
 MAX_SCRIPTS = 20000
 MAX_OUTPUT = 64 * 1024 * 1024          # bytes of text returned to the editor
 WORKERS = 8                            # parallel engine calls for big places
+MOPUP_BUDGET = 150                     # seconds for the slow retry of a burst's refusals
 WRITE_FILES = False
 EXTRACT_DIR = "/tmp/extracted"
 
@@ -2186,6 +2187,38 @@ def handle_place(raw, filename, decompile_one):
             for i, s in enumerate(todo):
                 texts[i], whys[i] = _one(s)
 
+        # A big game asks for hundreds of scripts at once, and the free engine
+        # starts refusing when a burst gets too hot.  Those refusals used to be
+        # final, and a refused script keeps its own code in the downloaded game -
+        # so whatever the burst missed is asked for again, one at a time with a
+        # pause.  A single drop of the same script always decompiles, so this
+        # turns "the engine was busy" into real code instead of a gap.
+        left = [i for i in range(len(todo)) if not texts[i]]
+        if left:
+            if len(todo) > 40:
+                time.sleep(2.0)                 # let the burst cool down first
+            deadline = t0 + MOPUP_BUDGET
+            for sweep in range(6):
+                if time.time() >= deadline:
+                    break
+                for i in [i for i in left if not texts[i]]:
+                    if time.time() >= deadline:
+                        break
+                    text, why = _one(todo[i])
+                    if text:
+                        texts[i], whys[i] = text, None
+                    else:
+                        whys[i] = why
+                    time.sleep(0.25)
+                if not [i for i in left if not texts[i]] or time.time() >= deadline:
+                    break
+                time.sleep(min(1.5 * (sweep + 1), 6.0))    # let it cool off a little
+            still = [i for i in left if not texts[i]]
+            if still:
+                notes.append("%d script(s) the engine kept refusing - their own code "
+                             "was left in place (drop the file again to retry)."
+                             % len(still))
+
         done = 0
         for s, text, why in zip(todo, texts, whys):
             if text:
@@ -2488,13 +2521,13 @@ class handler(BaseHTTPRequestHandler):
             # Last line of defence.  A whole game was already checked against
             # the file it came from (see check_edit) - here we only make sure
             # the blob is intact, so an unusual-but-real game is never refused.
-            if is_full and kind != "rbxl":
+            if is_full and kind in ("rbxlx", "rbxmx"):
                 import xml.etree.ElementTree as _ET
                 try:
                     _ET.fromstring(blob.decode("utf-8", "replace"))
                 except Exception as exc:
                     raise ValueError("the XML place does not read back (%s)" % exc)
-            elif is_full:
+            elif is_full:                       # .rbxl and .rbxm are both binary
                 chunks, why = read_chunks(blob)
                 if why:
                     raise ValueError(why)
