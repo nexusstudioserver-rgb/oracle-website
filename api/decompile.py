@@ -1434,8 +1434,14 @@ def normalize_framing(data):
     return bytes(out), fixes, mapping
 
 
-def edit_binary_place(data, texts):
+def edit_binary_place(data, texts, rewritten=None):
     """The same place, with the sources in `texts` written into it.
+
+    `rewritten` names the scripts whose code the decompiler produced.  Only their
+    compiled Bytecode is dropped (old compiled code next to new text would fight
+    in Studio); a script that merely got a marker line keeps its Bytecode, so the
+    rest of a game still runs.  When `rewritten` is None every text counts as
+    rewritten (the plain "replace these sources" call).
 
     A file that came in loose (see `normalize_framing`) is framed the way Studio
     writes places on the way out, so what you get back opens there.
@@ -1489,11 +1495,39 @@ def edit_binary_place(data, texts):
             body += _ustr(value)
         return _chunk(b"PROP", body)
 
+    changed = set(texts) if rewritten is None else set(rewritten)
     drop = set()
-    for cid, values in plan.items():
+    for cid in plan:
         refs = classes[cid][1]
-        if all(ref in texts for ref in refs) and cid in bytecode_at:
+        if all(ref in changed for ref in refs) and cid in bytecode_at:
             drop.add(bytecode_at[cid])                         # fully replaced: no stale bytecode
+
+    # Compiled code of the scripts we rewrote must go: old bytecode next to new
+    # text fights in Studio.  Where a class holds both rewritten and kept
+    # scripts, the rewritten slots are emptied and the kept ones stay - the chunk
+    # itself is not dropped, so nothing else moves.
+    bytecode_plan = {}
+    for cid in plan:
+        if cid not in bytecode_at:
+            continue
+        refs = classes[cid][1]
+        if all(ref in changed for ref in refs):
+            drop.add(bytecode_at[cid])
+            continue
+        try:
+            old_values = _prop_values(chunks[bytecode_at[cid]], classes, cid)
+        except Exception:
+            continue
+        if len(old_values) != len(refs):
+            continue
+        bytecode_plan[cid] = [b"" if ref in changed else old_values[i]
+                              for i, ref in enumerate(refs)]
+
+    def bytecode_chunk(cid):
+        body = struct.pack("<I", cid) + _ustr("Bytecode") + bytes([0x1d])
+        for value in bytecode_plan[cid]:
+            body += _ustr(value)
+        return _chunk(b"PROP", body)
 
     out = bytearray(data[:32])
     placed = set()
@@ -1504,6 +1538,9 @@ def edit_binary_place(data, texts):
         if cid in plan and pname == "Source" and source_at.get(cid) == i:
             out += source_chunk(cid)
             placed.add(cid)
+            continue
+        if cid in bytecode_plan and pname == "Bytecode" and bytecode_at.get(cid) == i:
+            out += bytecode_chunk(cid)
             continue
         if ch[0] == END_NAME:
             for cid in plan:
@@ -1522,13 +1559,13 @@ def edit_binary_place(data, texts):
         out += _plain_chunk(ch)
 
     result = bytes(out)
-    problems = check_edit(data, result, texts)
+    problems = check_edit(data, result, texts, rewritten)
     if problems:
         raise ValueError("the edited place would be rejected: " + "; ".join(problems[:4]))
     return result
 
 
-def check_edit(original, edited, texts):
+def check_edit(original, edited, texts, rewritten=None):
     """The edited place against the file it came from.  Returns problems.
 
     This is the promise the whole-game download makes, checked rather than
@@ -1573,29 +1610,59 @@ def check_edit(original, edited, texts):
         except Exception:
             return False
 
-    # what a script class was, and what it must be now
+    # what a script class was, and what it must be now.  Only the scripts whose
+    # code was really rewritten may lose their compiled Bytecode.
+    changed = set(texts) if rewritten is None else set(rewritten)
     replaced = {}
     for cid in script_cids:
         refs = classes[cid][1]
         if any(ref in texts for ref in refs):
             replaced[cid] = refs
     dropped = set()
+    emptied = {}                        # chunk index -> {referent: True} slots we cleared
     for i, ch in enumerate(achunks):
         cid, pname = _prop_name(ch, classes)
-        if pname == "Bytecode" and cid in replaced and all(r in texts for r in replaced[cid]):
+        if pname != "Bytecode" or cid not in replaced:
+            continue
+        refs = replaced[cid]
+        if all(r in changed for r in refs):
             dropped.add(i)
+        elif any(r in changed for r in refs):
+            emptied[i] = set(r for r in refs if r in changed)
 
-    expected = [ch for i, ch in enumerate(achunks) if i not in dropped]
+    expected = [(i, ch) for i, ch in enumerate(achunks) if i not in dropped]
     if len(expected) != len(bchunks):
         problems.append("the copy has %d chunks, the original's %d (minus %d dropped) - "
                         "something was dropped or added"
                         % (len(bchunks), len(achunks), len(dropped)))
         return problems
-    for a, b in zip(expected, bchunks):
+    for (index, a), b in zip(expected, bchunks):
         if is_source(a) and is_source(b):
             if a[0] != b[0] or _prop_name(a, classes)[0] != _prop_name(b, classes)[0]:
                 problems.append("two Source chunks ended up swapped")
                 break
+            continue
+        if index in emptied:
+            # the compiled code of the rewritten scripts must be gone, and every
+            # other instance's compiled code must be exactly as it was
+            cid = _prop_name(a, classes)[0]
+            refs = classes[cid][1]
+            try:
+                before = _prop_values(a, classes, cid)
+                after = _prop_values(b, classes, cid)
+            except Exception as exc:
+                problems.append("the Bytecode chunk of %s cannot be read (%s)"
+                                % (classes[cid][0], exc))
+                break
+            if len(before) != len(after):
+                problems.append("%s has %d compiled chunks for %d instances"
+                                % (classes[cid][0], len(after), len(refs)))
+                break
+            bad = [ref for ref, was, now in zip(refs, before, after)
+                   if (now != b"" if ref in emptied[index] else now != was)]
+            if bad:
+                problems.append("the compiled code of %s was not cleared exactly where "
+                                "the code was rewritten" % classes[cid][0])
             continue
         if not same_chunk(a, b):
             problems.append("the %s chunk does not match the original"
@@ -1633,7 +1700,7 @@ def check_edit(original, edited, texts):
     return problems
 
 
-def edit_xml_place(data, texts):
+def edit_xml_place(data, texts, rewritten=None):
     """The same idea for .rbxlx / .rbxmx files (text XML places).
 
     A script is rewritten only when there IS new text for it; every other item
@@ -1667,11 +1734,12 @@ def edit_xml_place(data, texts):
         if props is not None and cls in SCRIPT_CLASSES and ref in texts:
             new = texts[ref]
             new = new if isinstance(new, str) else new.decode("utf-8", "replace")
-            # exactly one Source, and no stale Bytecode
+            # exactly one Source; the compiled original goes only when the code
+            # in this script was really rewritten
             for sub in list(props):
                 if sub.get("name") == "Source":
                     props.remove(sub)
-                elif sub.get("name") == "Bytecode":
+                elif sub.get("name") == "Bytecode" and ref in rewritten:
                     props.remove(sub)
             src = ET.SubElement(props, "ProtectedString")
             src.set("name", "Source")
@@ -1691,15 +1759,16 @@ def edit_xml_place(data, texts):
     # no <?xml ...?> line: Studio and rbx-dom both want the file to start with
     # <roblox
     result = ET.tostring(root, encoding="utf-8", xml_declaration=False)
-    problems = check_xml_edit(data, result, texts)
+    problems = check_xml_edit(data, result, texts, rewritten)
     if problems:
         raise ValueError("the edited place would be rejected: " + "; ".join(problems[:4]))
     return result
 
 
-def check_xml_edit(original, edited, texts):
+def check_xml_edit(original, edited, texts, rewritten=None):
     """The XML copy against the file it came from: same items, same properties,
     the new source exactly where it was meant to go."""
+    rewritten = set(texts) if rewritten is None else set(rewritten)
     import xml.etree.ElementTree as ET
 
     def tag(el):
@@ -1739,8 +1808,11 @@ def check_xml_edit(original, edited, texts):
         if ca != cb or ra != rb:
             problems.append("item %r changed class or referent" % pa)
             continue
-        replaced = ra in texts or rb in texts
-        skip = ("Source", "Bytecode") if replaced else ()
+        skip = set()
+        if ra in texts or rb in texts:
+            skip.add("Source")
+        if (ra in rewritten) or (rb in rewritten):
+            skip.add("Bytecode")
         keys_a = {k for k in props_a if k not in skip}
         keys_b = {k for k in props_b if k not in skip}
         if keys_a != keys_b:
@@ -1749,13 +1821,13 @@ def check_xml_edit(original, edited, texts):
         for k in keys_a:
             if props_a[k] != props_b[k]:
                 problems.append("item %r's %s changed" % (pa, k))
+        got = props_b.get("Source", ("", ""))[1]
         want = texts.get(ra)
         if want is not None:
             want = want if isinstance(want, str) else want.decode("utf-8", "replace")
-            got = props_b.get("Source", ("", ""))[1]
             if got != want:
                 problems.append("the source of %r did not land in the copy" % pa)
-        elif props_b.get("Source", ("", ""))[1] != props_a.get("Source", ("", ""))[1]:
+        elif got != props_a.get("Source", ("", ""))[1]:
             problems.append("the source of %r changed although it was not replaced" % pa)
     return problems
 
@@ -1910,6 +1982,29 @@ def _collect(instances, parents):
     return scripts, len(instances)
 
 
+ORACLE_SITE = "oracle-websitel.vercel.app"
+ORACLE_LINE_DECOMPILED = "-- Decompiled by ORACLE (%s)" % ORACLE_SITE
+ORACLE_LINE_KEPT = ("-- ORACLE: kept as saved - this script has no compiled code to "
+                    "decompile")
+ORACLE_LINE_FAILED = ("-- ORACLE: the engine could not decompile this script - its own "
+                      "code was kept")
+ORACLE_LINE_EMPTY = "-- ORACLE: this script had no code in the file"
+ORACLE_MARKS = (ORACLE_LINE_DECOMPILED, ORACLE_LINE_KEPT, ORACLE_LINE_FAILED, ORACLE_LINE_EMPTY)
+
+
+def oracle_verdict(s):
+    """One line saying what happened to this script - it goes above everything in
+    the script, so opening any script in Studio tells you at a glance whether the
+    code in it came from Oracle."""
+    if s.get('ok'):
+        return ORACLE_LINE_DECOMPILED
+    if s['bytecode']:
+        return ORACLE_LINE_FAILED          # it had compiled code; we could not read it
+    if not s['source'].strip():
+        return ORACLE_LINE_EMPTY
+    return ORACLE_LINE_KEPT
+
+
 def place_body(s):
     """The text this script contributes to the .rbxl and to the editor.
 
@@ -1917,20 +2012,23 @@ def place_body(s):
     file can never disagree: what you read on the site is exactly what lands in
     the script when the game is opened in Studio.
 
-    Order: the decompiled code (whenever the engine produced some for this
-    script), then the file's own source text, then - only if there is neither -
-    a note saying what happened.  A script that shipped a protected/opaque source
-    string next to its compiled code therefore comes out as real code.
+    The first line is always an Oracle verdict (see `oracle_verdict`), then:
+
+      * the decompiled code, when the engine produced some for this script;
+      * otherwise the file's own source text, exactly as it was;
+      * otherwise a note saying what happened.
     """
+    # Exactly one line is ours, then the code as it is (or as the engine wrote
+    # it).  Nothing else is added or removed, so taking that first line back off
+    # gives the file's own text again, character for character.
+    verdict = oracle_verdict(s) + "\n"
     if s.get('ok') and s.get('decompiled'):
-        return s['decompiled']                      # the engine decompiled it
-    if s['source']:
-        return s['source'].decode('utf-8', 'replace')
+        return verdict + s['decompiled'].lstrip("\n")
+    if s['source'].strip():
+        return verdict + s['source'].decode('utf-8', 'replace')
     if s.get('decompiled'):
-        return s['decompiled']                      # the note explaining the gap
-    if s['bytecode']:
-        return "-- (compiled only - this script could not be decompiled)\n"
-    return "-- (empty script)\n"
+        return verdict + s['decompiled'].lstrip("\n")
+    return verdict          # nothing of its own: the verdict line says why
 
 
 def render_document(name, scripts, instance_count, fmt, extract_dir=None, notes=(), place_id=None, full_info=None):
@@ -1980,8 +2078,9 @@ def render_document(name, scripts, instance_count, fmt, extract_dir=None, notes=
         extra = ', "tail": %s' % json.dumps(tail) if tail else ''
         label = '-- @script {"path": %s, "class": %s, "index": %d%s}' % (
             json.dumps(s['path']), json.dumps(s['class']), i, extra)
-        block = "\n%s\n-- %s\n-- %s   [%s]\n-- %s\n\n%s\n" % (
-            label, "-" * 70, s['path'], s['class'], "-" * 70, body)
+        block = "\n%s\n-- %s\n-- %s   [%s]   %s\n-- %s\n\n%s\n" % (
+            label, "-" * 70, s['path'], s['class'],
+            oracle_verdict(s).replace("-- ", "", 1), "-" * 70, body)
         if used + len(block) > MAX_OUTPUT:
             truncated = True
             break
@@ -2012,15 +2111,7 @@ def write_scripts(name, scripts):
                  'ModuleScript': '.module.lua'}.get(s['class'], '.lua')
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            if s['source'].strip():
-                body = s['source'].decode('utf-8', 'replace')
-            elif s.get('decompiled'):
-                body = s['decompiled']
-            elif s['bytecode']:
-                body = ("-- (bytecode only - decompilation did not produce output;\n"
-                        "--  drop this .luauc directly into Oracle.html and try again)\n")
-            else:
-                body = "-- (empty script)\n"
+            body = place_body(s)
             with open(path, 'w', encoding='utf-8', errors='replace') as fh:
                 fh.write(body)
             written += 1
@@ -2131,27 +2222,24 @@ def handle_place(raw, filename, decompile_one):
         place_id = "p" + os.urandom(5).hex()
         payload = []
         texts = {}
-        kept = 0
+        rewritten = set()
         for s in scripts:
             text = place_body(s)
             payload.append({"path": s['path'], "class": s['class'], "body": text})
             if s.get('ref') is not None:
-                # A script the engine could not answer is NOT blanked in the
-                # whole game: it keeps its own code (and its Bytecode), so the
-                # rest of a big game still runs.
-                if s.get('ok', True):
-                    texts[s['ref']] = text
-                else:
-                    kept += 1
+                texts[s['ref']] = text
+                if s.get('ok'):
+                    rewritten.add(s['ref'])
+        kept = len([s for s in scripts if s.get('ref') is not None and not s.get('ok')])
         record = {"name": filename, "scripts": payload, "ts": time.time()}
         # the whole game: every instance kept, the script sources swapped
         try:
             ext = os.path.splitext(filename or "")[1].lower()
             if fmt == 'binary':
-                record["full"] = edit_binary_place(raw, texts)
+                record["full"] = edit_binary_place(raw, texts, rewritten)
                 record["fullkind"] = {"rbxm": "rbxm", "rbxmx": "rbxmx"}.get(ext.lstrip("."), "rbxl")
             else:
-                record["full"] = edit_xml_place(raw, texts)
+                record["full"] = edit_xml_place(raw, texts, rewritten)
                 record["fullkind"] = "rbxmx" if ext == ".rbxmx" else "rbxlx"
         except Exception as exc:
             notes.append("Could not rebuild the whole game (%s); the .rbxl will hold " 
