@@ -1,4 +1,4 @@
-<!-- Oracle build 2026-10-06 10:08 - whole game on Download, any game, any name -->
+<!-- Oracle build 2026-10-10 15:05 - hidden bytecode rescued, junk headers removed, LunaUX v1.4.6 -->
 <!DOCTYPE html><html><head>
 <script>
 /* ===========================================================================
@@ -696,7 +696,7 @@
     if (fetching[info.id]) { return fetching[info.id]; }
     var base = { 'Content-Type': 'application/json' };
     var p = fetch(url, { method: 'POST', headers: base,
-                         body: JSON.stringify({ oracle_build: { id: info.id } }) })
+                         body: JSON.stringify({ oracle_build: { id: info.id, filename: info.name, kind: info.kind } }) })
       .then(function (r) { return r.text(); })
       .then(function (txt) {
         var head;
