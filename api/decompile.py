@@ -22,8 +22,10 @@ import re
 import struct
 import tempfile
 import time
+import gzip
 import urllib.error
 import urllib.request
+import zlib
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler
 
@@ -1943,6 +1945,7 @@ def parse_xml_place(data):
                     'source': src.encode('utf-8', 'replace'),
                     'bytecode': base64.b64decode(bc) if bc else b'',
                     'ref': child.get('referent') or '',
+                    'had_bytecode': bool(bc),
                 })
             walk(child, here)
 
@@ -1978,7 +1981,8 @@ def _collect(instances, parents):
         src = inst['props'].get('Source') or b''
         bc = inst['props'].get('Bytecode') or b''
         scripts.append({'path': '/'.join(parts), 'class': inst['class'],
-                        'source': src, 'bytecode': bc, 'ref': ref})
+                        'source': src, 'bytecode': bc, 'ref': ref,
+                        'had_bytecode': bool(bc)})
     scripts.sort(key=lambda s: (s['path'], s['class']))
     return scripts, len(instances)
 
@@ -2047,13 +2051,143 @@ def _embedded_b64(source_text):
     return None, source_text
 
 
-def recover_hidden_bytecode(scripts, notes):
+def _looks_like_luau(blob):
+    """True when the bytes look like a Luau chunk (any version we know of).
+
+    Modern chunks open with a small version byte plus a types byte; the older
+    format opens with the 1b 4c 75 61 signature.  Both shapes are checked so a
+    wrapper is never mistaken for the real thing."""
+    if len(blob) < 12:
+        return False
+    if blob[:4] == b'\x1bLua':
+        return True
+    # modern chunks: version byte, types byte, magic key - the rest is data
+    return blob[0] <= 0x20 and blob[1] <= 0x10 and blob[2] <= 0x10
+
+
+def _peel_one(blob):
+    """One attempt to undo whatever wrapper an obfuscator put around a chunk.
+
+    Returns a list of candidate payloads worth trying next (may be empty)."""
+    out = []
+    if not blob or len(blob) < 8:
+        return out
+    if blob[:2] in (b'\x1f\x8b',):                        # gzip
+        try:
+            out.append(gzip.decompress(blob))
+        except Exception:
+            pass
+    if blob[:1] in (b'\x78',) and blob[1:2] in (b'\x9c', b'\x01', b'\xda', b'\x5e'):
+        try:                                              # zlib
+            out.append(zlib.decompress(blob))
+        except Exception:
+            pass
+    if blob[:4] == b'\x28\xb5\x2f\xfd':                # zstd frame
+        try:
+            import zstandard
+            out.append(zstandard.ZstdDecompressor().decompress(blob, max_output_size=64 * 1024 * 1024))
+        except Exception:
+            pass
+    if blob[:4] == b'\x04\x22\x4d\x18':                # lz4 frame
+        try:
+            import lz4.frame
+            out.append(lz4.frame.decompress(blob))
+        except Exception:
+            pass
+    if blob[:1] in (b'\x5d', b'\x5e'):                   # lzma/alone
+        try:
+            import lzma
+            out.append(lzma.decompress(blob))
+        except Exception:
+            pass
+    # plain base64 that was base64'd a second time
+    try:
+        txt = blob.decode('ascii')
+        if txt.strip() and all(c in _B64_CHARS for c in txt.strip()) and len(txt) % 4 < 3:
+            again = base64.b64decode(txt.strip() + '=' * (-len(txt.strip()) % 4))
+            if len(again) >= 12:
+                out.append(again)
+    except Exception:
+        pass
+    # Luau magic sitting a few bytes into the blob: hand back from there
+    if blob[:4] != b'\x1bLua':
+        i = blob.find(b'\x1bLua')
+        if 0 < i <= 64:
+            out.append(blob[i:])
+    # a custom header before a modern chunk: scan the first 64 offsets for
+    # anything shaped like a Luau chunk - keep every shape match and let the
+    # engine pre-flight pick the real one
+    if len(blob) > 24:
+        found = 0
+        for i in range(1, 65):
+            if len(blob) - i < 16:
+                break
+            if _looks_like_luau(blob[i:]):
+                out.append(blob[i:])
+                found += 1
+                if found >= 5:
+                    break
+    return out
+
+
+def unwrap_bytecode(blob):
+    """Peel wrappers until the bytes look like a genuine Luau chunk.
+
+    Obfuscators hide the real chunk under gzip/zlib/zstd/lz4/lzma layers,
+    a second base64 pass, or a small custom header.  Every layer that can be
+    undone is undone here, so the engine gets the chunk itself instead of its
+    packaging - that is the difference between DECOMPILED and the
+    "could not decompile" verdict."""
+    seen = set()
+    frontier = [blob]
+    best = blob
+    for _round in range(4):
+        nxt = []
+        for cand in frontier:
+            if not cand or cand in seen:
+                continue
+            seen.add(cand)
+            if _looks_like_luau(cand):
+                return cand
+            best = cand
+            nxt.extend(_peel_one(cand))
+        if not nxt:
+            break
+        frontier = nxt
+    return best
+
+
+def _engine_accepts(decompile_one, blob, tag):
+    """Cheap pre-flight: does the engine decompile these bytes?
+
+    Two looks, because the free engine has busy moments - a blob is only
+    declared unreadable when the engine refused it twice."""
+    for again in range(2):
+        try:
+            text = decompile_one({"bytecode": base64.b64encode(blob).decode(),
+                                  "filename": tag})
+            if text and text.strip():
+                return True
+        except Exception:
+            pass
+        if again == 0:
+            time.sleep(0.4)
+    return False
+
+
+def recover_hidden_bytecode(scripts, notes, decompile_one=None):
     """Rescue scripts whose compiled code is hidden inside their Source text.
 
     Runs before the engine loop: every recovered blob becomes the script's
     bytecode, so it goes through exactly the same decompile path (retries,
-    mop-up, verdict line) as a script that stored its bytecode properly."""
-    recovered = 0
+    mop-up, verdict line) as a script that stored its bytecode properly.
+
+    When a decompiler is handed in, wrapped blobs are peeled layer by layer
+    (gzip/zlib/zstd/lz4/lzma, double base64, custom headers) and each layer is
+    pre-flighted against the engine, so a script only carries bytecode the
+    engine can actually read - an unreadable blob is dropped instead of being
+    turned into a "could not decompile" verdict."""
+    recovered = unwrapped = 0
     for s in scripts:
         if s.get('bytecode'):
             continue                        # the real bytecode slot wins
@@ -2065,12 +2199,42 @@ def recover_hidden_bytecode(scripts, notes):
         if blob is None and cleaned == text:
             continue
         s['source'] = cleaned.encode('utf-8')
-        if blob is not None:
-            s['bytecode'] = blob
+        if blob is None:
+            continue                        # junk block with nothing decodable
+        good, layers = blob, 0
+        if decompile_one is not None and not _looks_like_luau(blob):
+            cand = unwrap_bytecode(blob)
+            if cand is not blob and _engine_accepts(decompile_one, cand, s.get('path') or 'script'):
+                good, layers = cand, 1
+            elif not _engine_accepts(decompile_one, blob, s.get('path') or 'script'):
+                # peel all the way down, pre-flighting every layer
+                frontier, seen, found = [blob], set(), None
+                for _round in range(4):
+                    nxt = []
+                    for c in frontier:
+                        if not c or c in seen:
+                            continue
+                        seen.add(c)
+                        if _looks_like_luau(c) and _engine_accepts(decompile_one, c, s.get('path') or 'script'):
+                            found = c
+                            break
+                        nxt.extend(_peel_one(c))
+                    if found:
+                        break
+                    frontier = nxt
+                if found:
+                    good, layers = found, 1
+                else:
+                    good = None             # unreadable: drop it, keep the source
+        if good is not None:
+            s['bytecode'] = good
             recovered += 1
+            if layers:
+                unwrapped += 1
     if recovered:
+        extra = " (%d had to be unwrapped first)" % unwrapped if unwrapped else ""
         notes.append("Recovered %d script(s) whose compiled code was hidden "
-                     "inside their source text." % recovered)
+                     "inside their source text%s." % (recovered, extra))
 
 
 def oracle_verdict(s):
@@ -2079,7 +2243,7 @@ def oracle_verdict(s):
     code in it came from Oracle."""
     if s.get('ok'):
         return ORACLE_LINE_DECOMPILED
-    if s['bytecode']:
+    if s['bytecode'] and s.get('had_bytecode'):
         return ORACLE_LINE_FAILED          # it had compiled code; we could not read it
     if not s['source'].strip():
         return ORACLE_LINE_EMPTY
@@ -2224,7 +2388,7 @@ def handle_place(raw, filename, decompile_one):
     notes = []
     # scripts whose compiled code was hidden inside their Source text (base64
     # block) are rescued here, before the engine loop decides what to decompile
-    recover_hidden_bytecode(scripts, notes)
+    recover_hidden_bytecode(scripts, notes, decompile_one)
     if not scripts:
         cls = set()
         notes.append("No Script / LocalScript / ModuleScript found in this file.")
