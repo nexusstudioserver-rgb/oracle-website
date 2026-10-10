@@ -1993,6 +1993,86 @@ ORACLE_LINE_EMPTY = "-- ORACLE: this script had no code in the file"
 ORACLE_MARKS = (ORACLE_LINE_DECOMPILED, ORACLE_LINE_KEPT, ORACLE_LINE_FAILED, ORACLE_LINE_EMPTY)
 
 
+# ---- hidden bytecode --------------------------------------------------------
+# Some save tools do not leave a script's compiled code in the Bytecode slot;
+# they embed a base64 copy of it inside the Source text instead:
+#
+#     -- Bytecode (Base64):
+#     -- DQMAAAEoAQAAAQoABK...
+#     -- [https://sitetest1.lua.expert](https://sitetest1.lua.expert)
+#
+# The quick look then sees "text exists" and keeps the script as-is, so the
+# code never reaches the decompiler and the junk block sits at the top of the
+# script in Studio.  This finds that block, pulls the blob back out, and cuts
+# the whole block out of the source so none of it is left behind.
+_B64_HEADER = re.compile(r'^\s*--+\s*bytecode\s*\(?base64\)?\s*:?\s*$', re.IGNORECASE)
+_B64_BODY = re.compile(r'^\s*--+\s*([A-Za-z0-9+/=\s]*)\s*$')
+_B64_LINK = re.compile(r'^\s*--+\s*\[?\s*https?://', re.IGNORECASE)
+_B64_CHARS = set('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=')
+
+
+def _embedded_b64(source_text):
+    """Find a '-- Bytecode (Base64):' block near the top of a script.
+
+    Returns (blob, cleaned): the decoded chunk when one was found (else None),
+    and the source text with the whole junk block - including the link line
+    the obfuscator writes under it - cut out."""
+    lines = source_text.split('\n')
+    for h in range(min(len(lines), 40)):
+        if not _B64_HEADER.match(lines[h]):
+            continue
+        j, acc = h + 1, []
+        while j < len(lines):
+            m = _B64_BODY.match(lines[j])
+            if not m:
+                break
+            body = m.group(1).strip()
+            if body and all(c in _B64_CHARS for c in body):
+                acc.append(body)
+            elif body:
+                break                       # a comment that is not base64 ends the block
+            j += 1
+        blob = None
+        joined = ''.join(acc)
+        if len(joined) >= 8:
+            try:
+                blob = base64.b64decode(joined + '=' * (-len(joined) % 4)) or None
+            except Exception:
+                blob = None
+        end = j
+        while end < len(lines) and _B64_LINK.match(lines[end]):
+            end += 1                        # the obfuscator's own link line goes too
+        cleaned = '\n'.join(lines[:h] + lines[end:]).strip('\n')
+        return blob, cleaned
+    return None, source_text
+
+
+def recover_hidden_bytecode(scripts, notes):
+    """Rescue scripts whose compiled code is hidden inside their Source text.
+
+    Runs before the engine loop: every recovered blob becomes the script's
+    bytecode, so it goes through exactly the same decompile path (retries,
+    mop-up, verdict line) as a script that stored its bytecode properly."""
+    recovered = 0
+    for s in scripts:
+        if s.get('bytecode'):
+            continue                        # the real bytecode slot wins
+        try:
+            text = s['source'].decode('utf-8', 'replace')
+        except Exception:
+            continue
+        blob, cleaned = _embedded_b64(text)
+        if blob is None and cleaned == text:
+            continue
+        s['source'] = cleaned.encode('utf-8')
+        if blob is not None:
+            s['bytecode'] = blob
+            recovered += 1
+    if recovered:
+        notes.append("Recovered %d script(s) whose compiled code was hidden "
+                     "inside their source text." % recovered)
+
+
 def oracle_verdict(s):
     """One line saying what happened to this script - it goes above everything in
     the script, so opening any script in Studio tells you at a glance whether the
@@ -2142,6 +2222,9 @@ def handle_place(raw, filename, decompile_one):
         scripts, count = parse_xml_place(raw)
 
     notes = []
+    # scripts whose compiled code was hidden inside their Source text (base64
+    # block) are rescued here, before the engine loop decides what to decompile
+    recover_hidden_bytecode(scripts, notes)
     if not scripts:
         cls = set()
         notes.append("No Script / LocalScript / ModuleScript found in this file.")
@@ -2459,6 +2542,16 @@ class handler(BaseHTTPRequestHandler):
                 return 500, "Could not unpack this game file: %s" % exc
 
         # ---- single script
+        # the compiled code may be hidden inside the source text as a base64
+        # block (see recover_hidden_bytecode) - rescue it the same way
+        if raw.lstrip()[:2] == b'--':
+            try:
+                blob, _cleaned = _embedded_b64(raw.decode('utf-8', 'replace'))
+            except Exception:
+                blob = None
+            if blob:
+                raw = blob
+
         note = diagnose(raw)
         if note:
             return 400, note
@@ -2497,10 +2590,16 @@ class handler(BaseHTTPRequestHandler):
             blob = tx_load("place", pid)
             if blob is not None:
                 try:
-                    record = {"name": "game", "scripts": json.loads(blob.decode("utf-8")),
+                    record = {"name": str(req.get("filename") or "game")[:200],
+                              "scripts": json.loads(blob.decode("utf-8")),
                               "ts": time.time()}
                 except Exception:
                     record = None
+        if record is not None and not record.get("fullkind"):
+            # recovered from disk: the kind was not parked with it, so take the
+            # caller's word for it (the page read it from the document header)
+            kind = str(req.get("kind") or "").lower()
+            record["fullkind"] = kind if kind in ("rbxl", "rbxlx", "rbxm", "rbxmx") else "rbxl"
         if not record or not record.get("scripts"):
             self._reply(200, json.dumps({
                 "ok": False,
