@@ -2007,6 +2007,32 @@ ORACLE_MARKS = (ORACLE_LINE_DECOMPILED, ORACLE_LINE_KEPT, ORACLE_LINE_FAILED, OR
 UNIVERSAL_SYN_LINE = ("-- Saved by UniversalSynSaveInstance (Join to Copy Games) "
                       "https://discord.gg/wx4ThpAsmw")
 
+# The engine prints its own advertising/version lines above the code.  The
+# contract, as asked: ONLY the UniversalSynSaveInstance line sits above a
+# worked script's code - so the engine's banner comes off.  A line is removed
+# only when it starts with a known banner prefix; code is never touched.
+_ENGINE_BANNERS = ("-- [[ lunaux-decompiler.dev", "-- [[ Luau version")
+
+
+def _strip_engine_banner(text):
+    """Remove the engine's leading banner lines (and the blank line after
+    them) from a decompiled answer.  Anything else is returned exactly as it
+    came back."""
+    if not text:
+        return text
+    lines = text.split("\n")
+    i, cut = 0, False
+    while i < len(lines) and lines[i].lstrip("\ufeff").rstrip().startswith(_ENGINE_BANNERS):
+        i += 1
+        cut = True
+    if cut:
+        while i < len(lines) and not lines[i].strip():
+            i += 1
+        return "\n".join(lines[i:])
+    return text
+
+
+
 
 # ---- hidden bytecode --------------------------------------------------------
 # Some save tools do not leave a script's compiled code in the Bytecode slot;
@@ -2470,7 +2496,7 @@ def handle_place(raw, filename, decompile_one):
                                "filename": s['path']}
                     text = decompile_one(payload)
                     if text and text.strip():
-                        return text, None
+                        return _strip_engine_banner(text), None
                     why = "the engine sent an empty answer"
                 except Exception as exc:
                     why = str(exc)
@@ -2737,7 +2763,7 @@ class handler(BaseHTTPRequestHandler):
         if self._route() in ("/", "/health", "/status", "/decompile"):
             self._reply(200, json.dumps({
                 "ok": True,
-                "build": "2026-10-22 - UniversalSyn top line on every worked script + Studio-open gate",
+                "build": "2026-10-22 - only the UniversalSyn line above every worked script",
                 "bridge": "Oracle local engine",
                 "engine": UPSTREAM,
                 "needs_api_key": False,
@@ -2782,7 +2808,7 @@ class handler(BaseHTTPRequestHandler):
         # The Authorization header is deliberately ignored: the engine needs no
         # key, so nothing on this path can reject or revoke anything.
         try:
-            return 200, UNIVERSAL_SYN_LINE + "\n" + forward(payload)
+            return 200, UNIVERSAL_SYN_LINE + "\n" + _strip_engine_banner(forward(payload))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:300]
             if exc.code in (500, 502):
