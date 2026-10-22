@@ -780,6 +780,7 @@ import struct
 
 
 
+
 # ---------------------------------------------------------------- LZ4 block ---
 def lz4_compress_block(src):
     """LZ4 block format (the one Roblox writes and lz4.block.compress makes).
@@ -1107,6 +1108,7 @@ def check_binary_place(data):
         return ["not a Roblox binary file"]
     count = struct.unpack_from("<i", data, 20)[0]
     refs, parents, seen = [], {}, set()
+    saw_end = False
     off = 32
     while off + 16 <= len(data):
         name = data[off:off + 4]
@@ -1124,6 +1126,7 @@ def check_binary_place(data):
                            % (name.rstrip(b"\x00").decode("latin1"), exc))
                 continue
         if name == b"END\x00":
+            saw_end = True
             if body != b"</roblox>":
                 bad.append("the END chunk must hold </roblox>")
             break
@@ -1138,6 +1141,8 @@ def check_binary_place(data):
             pars, _p = _read_refs(body, p, i_count)
             for kid, par in zip(kids, pars):
                 parents[kid] = par
+    if not saw_end:
+        bad.append("the place has no closing END chunk")
     if len(refs) != count:
         bad.append("header says %d instances but the chunks describe %d"
                    % (count, len(refs)))
@@ -1189,7 +1194,6 @@ except ImportError:                      # pragma: no cover
     pass
 
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
-SCRIPT_CLASSES = ("Script", "LocalScript", "ModuleScript")
 END_NAME = b"END\x00"
 
 
@@ -2377,6 +2381,46 @@ def looks_like_place(raw):
     return None
 
 
+def _full_is_openable(record):
+    """True only when the parked whole-game blob passes the same rules Studio
+    applies while opening a place.  Converter tools ship files with broken
+    framing (instances numbered 1..N, counts off by one, parents that are not
+    in the file); the rebuild normalises all of that, and this is the check
+    that proves it worked."""
+    blob = record.get("full")
+    if not blob:
+        return False
+    kind = record.get("fullkind", "rbxl")
+    if kind in ("rbxlx", "rbxmx"):
+        try:
+            import xml.etree.ElementTree as _ET
+            _ET.fromstring(blob.decode("utf-8", "replace"))
+            return True
+        except Exception:
+            return False
+    return check_binary_place(blob) == []
+
+
+def _force_openable_full(record, payload, notes):
+    """The last gate before a download: if the rebuilt game would not open in
+    Studio for ANY reason, replace it with the scripts-and-folders place, which
+    is openable by construction.  A download that refuses to open is worse than
+    a download without the props of a Part."""
+    if record.get("full") and _full_is_openable(record):
+        return False
+    had = bool(record.get("full"))
+    try:
+        record["full"] = build_binary_place(payload)
+        record["fullkind"] = "rbxl"
+    except Exception:
+        record.pop("full", None)
+    if had:
+        notes.append("The rebuilt game file did not pass the Studio-open check; "
+                     "the download holds the scripts and their folders instead - "
+                     "every script, decompiled, in its own folders.")
+    return had
+
+
 def handle_place(raw, filename, decompile_one):
     fmt = looks_like_place(raw)
     t0 = time.time()
@@ -2522,8 +2566,9 @@ def handle_place(raw, filename, decompile_one):
                 record["full"] = edit_xml_place(raw, texts, rewritten)
                 record["fullkind"] = "rbxmx" if ext == ".rbxmx" else "rbxlx"
         except Exception as exc:
-            notes.append("Could not rebuild the whole game (%s); the .rbxl will hold " 
+            notes.append("Could not rebuild the whole game (%s); the .rbxl will hold "
                          "the scripts and their folders." % exc)
+        _force_openable_full(record, payload, notes)
         if kept:
             notes.append("Kept the original code of %d script(s) the engine did not "
                          "answer - the whole-game file has no empty scripts." % kept)
@@ -2683,6 +2728,7 @@ class handler(BaseHTTPRequestHandler):
         if self._route() in ("/", "/health", "/status", "/decompile"):
             self._reply(200, json.dumps({
                 "ok": True,
+                "build": "2026-10-22 - Studio-open gate: a game-file download can never refuse to open",
                 "bridge": "Oracle local engine",
                 "engine": UPSTREAM,
                 "needs_api_key": False,
