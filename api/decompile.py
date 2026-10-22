@@ -2014,6 +2014,30 @@ UNIVERSAL_SYN_LINE = ("-- Saved by UniversalSynSaveInstance (Join to Copy Games)
 _ENGINE_BANNERS = ("-- [[ lunaux-decompiler.dev", "-- [[ Luau version")
 
 
+def _clean_kept_source(text):
+    """A script kept as saved carries the file's own text - and copied games
+    often store OLD site output in there: a duplicate UniversalSyn stamp, an
+    old Oracle verdict line, old engine banners.  All of that comes off the
+    top (only the top - the script's own code and comments are never touched),
+    so the script reads: the UniversalSyn line, then code."""
+    junk_prefixes = (UNIVERSAL_SYN_LINE, "-- Decompiled by ORACLE", "-- ORACLE:") \
+        + _ENGINE_BANNERS
+    lines = text.split("\n")
+    i, cut = 0, False
+    while i < len(lines):
+        ln = lines[i].lstrip("\ufeff").rstrip()
+        if ln.startswith(junk_prefixes):
+            i += 1
+            cut = True
+            continue
+        break
+    if cut:
+        while i < len(lines) and not lines[i].strip():
+            i += 1
+        return "\n".join(lines[i:])
+    return text
+
+
 def _strip_engine_banner(text):
     """Remove the engine's leading banner lines (and the blank line after
     them) from a decompiled answer.  Anything else is returned exactly as it
@@ -2275,18 +2299,16 @@ def recover_hidden_bytecode(scripts, notes, decompile_one=None):
 
 
 def oracle_verdict(s):
-    """One line saying what happened to this script - it goes above everything in
-    the script, so opening any script in Studio tells you at a glance where the
-    code came from.  A script the engine decompiled starts with ONLY the
-    UniversalSynSaveInstance line; every other outcome keeps its Oracle
-    verdict, which says honestly what happened."""
+    """The status shown on the script's separator line in the document - the
+    honest record of what happened, kept OUT of the script text itself: every
+    script wears only the UniversalSynSaveInstance line on top (place_body)."""
     if s.get('ok'):
         return UNIVERSAL_SYN_LINE
     if s['bytecode'] and s.get('had_bytecode'):
-        return ORACLE_LINE_FAILED          # it had compiled code; we could not read it
+        return "the engine could not decompile this script - its own code was kept"
     if not s['source'].strip():
-        return ORACLE_LINE_EMPTY
-    return ORACLE_LINE_KEPT
+        return "this script had no code in the file"
+    return "kept as saved - this script has no compiled code to decompile"
 
 
 def place_body(s):
@@ -2296,23 +2318,26 @@ def place_body(s):
     file can never disagree: what you read on the site is exactly what lands in
     the script when the game is opened in Studio.
 
-    The first line is always an Oracle verdict (see `oracle_verdict`), then:
+    Contract, as asked: line 1 of EVERY script is the UniversalSynSaveInstance
+    line, and nothing else stands above the code:
 
-      * the decompiled code, when the engine produced some for this script;
-      * otherwise the file's own source text, exactly as it was;
-      * otherwise a note saying what happened.
+      * a decompiled script: the line, then the engine's code (banners off);
+      * a script kept as saved (or kept after a failed decompile): the line,
+        then the file's own text with old verdicts, old engine banners and
+        duplicate stamps cleaned off the top;
+      * a script with nothing in it: just the line.
+
+    What happened to each script is documented on its separator line in the
+    document (oracle_verdict), never stacked inside the script text.
     """
-    # Exactly one line is ours, then the code as it is (or as the engine wrote
-    # it).  Nothing else is added or removed, so taking that first line back off
-    # gives the file's own text again, character for character.
-    verdict = oracle_verdict(s) + "\n"
+    top = UNIVERSAL_SYN_LINE + "\n"
     if s.get('ok') and s.get('decompiled'):
-        return verdict + s['decompiled'].lstrip("\n")
+        return top + s['decompiled'].lstrip("\n")
     if s['source'].strip():
-        return verdict + s['source'].decode('utf-8', 'replace')
+        return top + _clean_kept_source(s['source'].decode('utf-8', 'replace'))
     if s.get('decompiled'):
-        return verdict + s['decompiled'].lstrip("\n")
-    return verdict          # nothing of its own: the verdict line says why
+        return top + s['decompiled'].lstrip("\n")
+    return UNIVERSAL_SYN_LINE      # nothing of its own: just the line
 
 
 def render_document(name, scripts, instance_count, fmt, extract_dir=None, notes=(), place_id=None, full_info=None):
@@ -2763,7 +2788,7 @@ class handler(BaseHTTPRequestHandler):
         if self._route() in ("/", "/health", "/status", "/decompile"):
             self._reply(200, json.dumps({
                 "ok": True,
-                "build": "2026-10-22 - only the UniversalSyn line above every worked script",
+                "build": "2026-10-22 - every script wears only the UniversalSyn line",
                 "bridge": "Oracle local engine",
                 "engine": UPSTREAM,
                 "needs_api_key": False,
