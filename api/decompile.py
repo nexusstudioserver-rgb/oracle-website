@@ -2014,46 +2014,46 @@ UNIVERSAL_SYN_LINE = ("-- Saved by UniversalSynSaveInstance (Join to Copy Games)
 _ENGINE_BANNERS = ("-- [[ lunaux-decompiler.dev", "-- [[ Luau version")
 
 
-def _clean_kept_source(text):
-    """A script kept as saved carries the file's own text - and copied games
-    often store OLD site output in there: a duplicate UniversalSyn stamp, an
-    old Oracle verdict line, old engine banners.  All of that comes off the
-    top (only the top - the script's own code and comments are never touched),
-    so the script reads: the UniversalSyn line, then code."""
-    junk_prefixes = (UNIVERSAL_SYN_LINE, "-- Decompiled by ORACLE", "-- ORACLE:") \
-        + _ENGINE_BANNERS
-    lines = text.split("\n")
-    i, cut = 0, False
-    while i < len(lines):
-        ln = lines[i].lstrip("\ufeff").rstrip()
-        if ln.startswith(junk_prefixes):
-            i += 1
-            cut = True
-            continue
-        break
-    if cut:
-        while i < len(lines) and not lines[i].strip():
-            i += 1
-        return "\n".join(lines[i:])
-    return text
-
-
-def _strip_engine_banner(text):
-    """Remove the engine's leading banner lines (and the blank line after
-    them) from a decompiled answer.  Anything else is returned exactly as it
-    came back."""
+def _clean_top_lines(text, prefixes):
+    """Remove leading junk lines - anything starting with one of `prefixes` -
+    together with blank lines interleaved between them (old saves often read:
+    stamp, banner, BLANK, banner, code).  Blank lines are only eaten once at
+    least one junk line was removed, and a code line always stops the sweep:
+    the script's own text is never touched."""
     if not text:
         return text
     lines = text.split("\n")
     i, cut = 0, False
-    while i < len(lines) and lines[i].lstrip("\ufeff").rstrip().startswith(_ENGINE_BANNERS):
-        i += 1
-        cut = True
-    if cut:
-        while i < len(lines) and not lines[i].strip():
+    while i < len(lines):
+        ln = lines[i].lstrip("\ufeff").rstrip()
+        if ln.startswith(prefixes):
             i += 1
-        return "\n".join(lines[i:])
-    return text
+            cut = True
+            continue
+        if cut and not ln:
+            i += 1
+            continue
+        break
+    if not cut:
+        return text
+    return "\n".join(lines[i:])
+
+
+def _clean_kept_source(text):
+    """A script kept as saved carries the file's own text - and copied games
+    often store OLD site output in there: a duplicate UniversalSyn stamp, old
+    Oracle verdict lines, old engine banners (with blanks between them).  All
+    of that comes off the top, so the script reads: the UniversalSyn line,
+    then code."""
+    return _clean_top_lines(
+        text, (UNIVERSAL_SYN_LINE, "-- Decompiled by ORACLE", "-- ORACLE:") + _ENGINE_BANNERS)
+
+
+def _strip_engine_banner(text):
+    """Remove the engine's own leading banner lines (and any blank line between
+    or after them) from a decompiled answer.  Anything else comes back exactly
+    as the engine wrote it."""
+    return _clean_top_lines(text, _ENGINE_BANNERS)
 
 
 
@@ -2788,7 +2788,7 @@ class handler(BaseHTTPRequestHandler):
         if self._route() in ("/", "/health", "/status", "/decompile"):
             self._reply(200, json.dumps({
                 "ok": True,
-                "build": "2026-10-22 - every script wears only the UniversalSyn line",
+                "build": "2026-10-22 - only the UniversalSyn line on top; banners cleaned everywhere",
                 "bridge": "Oracle local engine",
                 "engine": UPSTREAM,
                 "needs_api_key": False,
