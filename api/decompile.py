@@ -2000,6 +2000,13 @@ ORACLE_LINE_FAILED = ("-- ORACLE: the engine could not decompile this script - i
 ORACLE_LINE_EMPTY = "-- ORACLE: this script had no code in the file"
 ORACLE_MARKS = (ORACLE_LINE_DECOMPILED, ORACLE_LINE_KEPT, ORACLE_LINE_FAILED, ORACLE_LINE_EMPTY)
 
+# The one line every WORKED (decompiled) script starts with, as asked: only
+# this line at the top - the Oracle verdict header is not printed for scripts
+# the engine decompiled.  Kept / failed / empty scripts keep their Oracle
+# verdict lines, which say honestly what happened.
+UNIVERSAL_SYN_LINE = ("-- Saved by UniversalSynSaveInstance (Join to Copy Games) "
+                      "https://discord.gg/wx4ThpAsmw")
+
 
 # ---- hidden bytecode --------------------------------------------------------
 # Some save tools do not leave a script's compiled code in the Bytecode slot;
@@ -2243,10 +2250,12 @@ def recover_hidden_bytecode(scripts, notes, decompile_one=None):
 
 def oracle_verdict(s):
     """One line saying what happened to this script - it goes above everything in
-    the script, so opening any script in Studio tells you at a glance whether the
-    code in it came from Oracle."""
+    the script, so opening any script in Studio tells you at a glance where the
+    code came from.  A script the engine decompiled starts with ONLY the
+    UniversalSynSaveInstance line; every other outcome keeps its Oracle
+    verdict, which says honestly what happened."""
     if s.get('ok'):
-        return ORACLE_LINE_DECOMPILED
+        return UNIVERSAL_SYN_LINE
     if s['bytecode'] and s.get('had_bytecode'):
         return ORACLE_LINE_FAILED          # it had compiled code; we could not read it
     if not s['source'].strip():
@@ -2728,7 +2737,7 @@ class handler(BaseHTTPRequestHandler):
         if self._route() in ("/", "/health", "/status", "/decompile"):
             self._reply(200, json.dumps({
                 "ok": True,
-                "build": "2026-10-22 - Studio-open gate: a game-file download can never refuse to open",
+                "build": "2026-10-22 - UniversalSyn top line on every worked script + Studio-open gate",
                 "bridge": "Oracle local engine",
                 "engine": UPSTREAM,
                 "needs_api_key": False,
@@ -2773,7 +2782,7 @@ class handler(BaseHTTPRequestHandler):
         # The Authorization header is deliberately ignored: the engine needs no
         # key, so nothing on this path can reject or revoke anything.
         try:
-            return 200, forward(payload)
+            return 200, UNIVERSAL_SYN_LINE + "\n" + forward(payload)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:300]
             if exc.code in (500, 502):
