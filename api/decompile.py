@@ -2056,6 +2056,102 @@ def _strip_engine_banner(text):
     return _clean_top_lines(text, _ENGINE_BANNERS)
 
 
+# ---- house output style -----------------------------------------------------
+# The owner compares every answer against the "Real Oracle Original" printout.
+# Four of its habits can be reproduced exactly without touching the meaning of
+# a single line of code:
+#
+#   * a discarded CALL is a bare statement:   game:GetService("AdService")
+#     (but a discarded non-call keeps its binding: `local _ = game.Sound.Click`
+#      - a bare property read is not a legal statement, and the original
+#      engine keeps it bound too);
+#   * the engine's trailing block comment   --[[ Line: 114 | Named "x" ]]
+#     becomes the original's line comment    -- line: 114 | named "x"
+#     (only at end of line - mid-line `function() --[[ Line: 8 ]] end` must
+#      stay a BLOCK comment or the `end` would be commented out);
+#   * LunaUX's inferred type annotations on locals and return values
+#     (`local Seeds: string = ...`, `function f(a): boolean`) are dropped -
+#     the original shows types only on parameters, so parameter annotations
+#     are kept;
+#   * `x += n` goes back to `x = x + n` - that one is a real engine option
+#     (transformCompoundAssignments=false), sent with every request below.
+#
+# What CANNOT be reproduced: the original's variable names (Seed_Shop, u30,
+# t1...) and its blank-line rhythm come from inside the private engine that
+# printed it; renaming identifiers here could break working code, so names
+# stay exactly as LunaUX recovered them.
+
+_LINE_COMMENT = re.compile(r'--\[\[\s*Line:\s*(\d+)(?:\s*\|\s*Named\s*"([^"]*)")?\s*\]\][ \t]*$')
+_LOCAL_DISCARD = re.compile(r'^([ \t]*)local _(?:[ \t]*,[ \t]*_)*[ \t]*=[ \t]*(.+?)[ \t]*$')
+_TYPE = r"[A-Za-z_][\w.]*(?:[ \t]*<[^\n<>]*>)?\??(?:[ \t]*\|[ \t]*[A-Za-z_][\w.]*(?:[ \t]*<[^\n<>]*>)?\??)*"
+_LOCAL_ANNOT = re.compile(r'^([ \t]*local[ \t]+[A-Za-z_]\w*)[ \t]*:[ \t]*' + _TYPE + r'[ \t]*=')
+_RET_ANNOT = re.compile(r'\)[ \t]*:[ \t]*' + _TYPE + r'(?=[ \t]*(?:--|$))')
+_CALL_HEAD = re.compile(r'^[A-Za-z_][\w.:]*$')
+
+
+def _bare_call(rhs):
+    """Return `rhs` when it is exactly one balanced call expression (safe to
+    stand alone as a statement), else None."""
+    if not rhs.endswith(')'):
+        return None
+    open_at = rhs.find('(')
+    if open_at < 0 or not _CALL_HEAD.match(rhs[:open_at]):
+        return None
+    depth, in_str, esc = 0, None, False
+    for i, ch in enumerate(rhs[open_at:], open_at):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == in_str:
+                in_str = None
+            continue
+        if ch in '"\'':
+            in_str = ch
+        elif ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth == 0 and i != len(rhs) - 1:
+                return None              # something trails the call: keep bound
+        if depth < 0:
+            return None
+    return rhs if depth == 0 and in_str is None else None
+
+
+def _original_style(text):
+    """Restyle decompiled engine output the way the Real Oracle Original reads.
+    Comment shapes and annotation cosmetics only - never an executable token.
+    Idempotent, and applied to engine answers only (kept source is untouched)."""
+    if not text:
+        return text
+    out = []
+    for line in text.split("\n"):
+        # return-type annotation off (keep parameter annotations)
+        m = _RET_ANNOT.search(line)
+        if m and line[:m.start()].count('"') % 2 == 0 and line[:m.start()].count("'") % 2 == 0:
+            line = line[:m.start()] + ")" + line[m.end():]
+        # trailing --[[ Line: N | Named "x" ]]  ->  -- line: N | named "x"
+        m = _LINE_COMMENT.search(line)
+        if m:
+            head = line[:m.start()].rstrip()
+            tail = "-- line: " + m.group(1)
+            if m.group(2):
+                tail += ' | named "' + m.group(2) + '"'
+            line = (head + " " + tail) if head else tail
+        # local _ = CALL  ->  bare CALL   (non-call rhs stays bound)
+        m = _LOCAL_DISCARD.match(line)
+        if m:
+            bare = _bare_call(m.group(2))
+            if bare is not None:
+                line = m.group(1) + bare
+        # inferred local-type annotation off
+        line = _LOCAL_ANNOT.sub(r"\1 =", line, count=1)
+        out.append(line)
+    return "\n".join(out)
+
+
 
 
 # ---- hidden bytecode --------------------------------------------------------
@@ -2321,10 +2417,12 @@ def place_body(s):
     Contract, as asked: line 1 of EVERY script is the UniversalSynSaveInstance
     line, and nothing else stands above the code:
 
-      * a decompiled script: the line, then the engine's code (banners off);
+      * a decompiled script: the line, one blank line (the way the Real Oracle
+        Original reads), then the engine's code (banners off, house style);
       * a script kept as saved (or kept after a failed decompile): the line,
         then the file's own text with old verdicts, old engine banners and
-        duplicate stamps cleaned off the top;
+        duplicate stamps cleaned off the top - byte for byte, no blank line
+        inserted, so the game's own source stays exactly as it was saved;
       * a script with nothing in it: just the line.
 
     What happened to each script is documented on its separator line in the
@@ -2332,11 +2430,11 @@ def place_body(s):
     """
     top = UNIVERSAL_SYN_LINE + "\n"
     if s.get('ok') and s.get('decompiled'):
-        return top + s['decompiled'].lstrip("\n")
+        return UNIVERSAL_SYN_LINE + "\n\n" + s['decompiled'].lstrip("\n")
     if s['source'].strip():
         return top + _clean_kept_source(s['source'].decode('utf-8', 'replace'))
     if s.get('decompiled'):
-        return top + s['decompiled'].lstrip("\n")
+        return UNIVERSAL_SYN_LINE + "\n\n" + s['decompiled'].lstrip("\n")
     return UNIVERSAL_SYN_LINE      # nothing of its own: just the line
 
 
@@ -2521,7 +2619,7 @@ def handle_place(raw, filename, decompile_one):
                                "filename": s['path']}
                     text = decompile_one(payload)
                     if text and text.strip():
-                        return _strip_engine_banner(text), None
+                        return _original_style(_strip_engine_banner(text)), None
                     why = "the engine sent an empty answer"
                 except Exception as exc:
                     why = str(exc)
@@ -2666,6 +2764,23 @@ def forward(payload):
         return resp.read().decode("utf-8", errors="replace")
 
 
+# The Real Oracle Original never prints `x += n`; it expands every compound
+# assignment.  That is a documented engine option, so the house style is fixed
+# here - the frozen page sends no options of its own and never has to change.
+_STYLE_OPTIONS = {"transformCompoundAssignments": False}
+
+
+def forward_styled(payload):
+    """forward() with the house engine options merged in.  Options explicitly
+    present in the payload win over the house defaults."""
+    p = dict(payload)
+    opts = dict(_STYLE_OPTIONS)
+    if isinstance(p.get("options"), dict):
+        opts.update(p["options"])
+    p["options"] = opts
+    return forward(p)
+
+
 def diagnose(raw):
     """Friendly explanation when the input clearly isn't Luau bytecode."""
     if len(raw) < 4:
@@ -2788,7 +2903,7 @@ class handler(BaseHTTPRequestHandler):
         if self._route() in ("/", "/health", "/status", "/decompile"):
             self._reply(200, json.dumps({
                 "ok": True,
-                "build": "2026-10-22 - only the UniversalSyn line on top; banners cleaned everywhere",
+                "build": "2026-10-23 - decompiled output restyled to match the Real Oracle Original",
                 "bridge": "Oracle local engine",
                 "engine": UPSTREAM,
                 "needs_api_key": False,
@@ -2805,7 +2920,7 @@ class handler(BaseHTTPRequestHandler):
         """Return (status, text) for one uploaded file."""
         if looks_like_place(raw):
             try:
-                return 200, handle_place(raw, filename, forward)
+                return 200, handle_place(raw, filename, forward_styled)
             except RbxError as exc:
                 return 400, str(exc)
             except Exception as exc:
@@ -2833,7 +2948,8 @@ class handler(BaseHTTPRequestHandler):
         # The Authorization header is deliberately ignored: the engine needs no
         # key, so nothing on this path can reject or revoke anything.
         try:
-            return 200, UNIVERSAL_SYN_LINE + "\n" + _strip_engine_banner(forward(payload))
+            return 200, (UNIVERSAL_SYN_LINE + "\n\n"
+                         + _original_style(_strip_engine_banner(forward_styled(payload))))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:300]
             if exc.code in (500, 502):
