@@ -1,25 +1,45 @@
 #!/usr/bin/env python3
 """
-Oracle decompiler - serverless endpoint (Vercel Python function)
-================================================================
+Oracle local engine bridge  +  whole-game script extractor
+===========================================================
 
-Accepts, as JSON on POST:
-  * {script|bytecode: <base64>, filename}  - one compiled Luau chunk, or
-    a whole Roblox place/model (.rbxl .rbxlx .rbxm .rbxmx) to unpack, or
-  * {oracle_upload: {id, index|finish, total, filename}, chunk}  - one piece
-    of a big file (hosts cap a single body at 4.5 MB), or
-  * {oracle_result: {id, part}}  - one piece of a big answer.
+Runs a small local web server that Oracle.html talks to instead of the paid
+mshq.dev servers. Two things happen here:
 
-GET returns a small health JSON. No API key is required anywhere on this
-path, so the key typed in the page is never validated or rejected.
+1. COMPILED SCRIPT  (.luac / .luauc)
+   Forwarded to a free, open Luau decompiler engine that needs NO api key:
+       POST https://lunaux-decompiler.dev/api/decompile
+
+2. WHOLE GAME / MODEL  (.rbxl  .rbxlx  .rbxm  .rbxmx)
+   The file is unpacked locally and EVERY script inside is extracted:
+     * Roblox binary format (LZ4/ZSTD chunks, parsed here in pure Python)
+     * Roblox XML format
+   Scripts that still contain their source come out as real Lua, ready to read.
+   Scripts that only contain compiled bytecode are sent to the decompiler.
+   Results are returned in one document and also written to ./extracted/<file>/
+
+Because the engine needs no key, the API key box in Oracle.html is cosmetic:
+ANY key you type works, including keys that were revoked elsewhere.
+
+Usage
+-----
+    python3 oracle_server.py                  # 127.0.0.1:8787
+    python3 oracle_server.py --port 9000
+    python3 oracle_server.py --upstream URL
+    python3 oracle_server.py --no-write       # don't write extracted/ files
+
+Requires Python 3.8+, standard library only (ZSTD chunks additionally need
+`pip install zstandard`; LZ4 is handled by a built-in decoder).
 """
 
+import argparse
 import base64
 import concurrent.futures
 import json
 import os
 import re
 import struct
+import sys
 import tempfile
 import time
 import gzip
@@ -27,7 +47,7 @@ import urllib.error
 import urllib.request
 import zlib
 import xml.etree.ElementTree as ET
-from http.server import BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DEFAULT_UPSTREAM = "https://lunaux-decompiler.dev/api/decompile"
 UPSTREAM = DEFAULT_UPSTREAM
@@ -37,8 +57,8 @@ MAX_SCRIPTS = 20000
 MAX_OUTPUT = 64 * 1024 * 1024          # bytes of text returned to the editor
 WORKERS = 8                            # parallel engine calls for big places
 MOPUP_BUDGET = 150                     # seconds for the slow retry of a burst's refusals
-WRITE_FILES = False
-EXTRACT_DIR = "/tmp/extracted"
+WRITE_FILES = True
+EXTRACT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "extracted")
 
 # ---- chunked transfer -------------------------------------------------------
 # Hosts such as Vercel cap a single request *and* response body at 4.5 MB. Files
@@ -2861,7 +2881,7 @@ def assemble(b64):
     return base64.b64decode(b64 + '=' * (-len(b64) % 4))
 
 
-class handler(BaseHTTPRequestHandler):
+class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "OracleLocalEngine/2.0"
 
@@ -2883,7 +2903,7 @@ class handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def log_message(self, fmt, *args):
-        pass    # Vercel already logs every request
+        sys.stderr.write("  %s\n" % (fmt % args))
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -3212,3 +3232,41 @@ class handler(BaseHTTPRequestHandler):
             self._park_result(text)                 # too big for one reply
             return
         self._reply(status, text)
+
+
+def main():
+    global UPSTREAM, WRITE_FILES
+    ap = argparse.ArgumentParser(description="Local bridge for Oracle.html")
+    ap.add_argument("--port", type=int, default=8787)
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--upstream", default=DEFAULT_UPSTREAM)
+    ap.add_argument("--no-write", action="store_true",
+                    help="don't write extracted scripts to disk")
+    args = ap.parse_args()
+    UPSTREAM = args.upstream
+    WRITE_FILES = not args.no_write
+
+    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    print("=" * 70)
+    print(" Oracle local engine")
+    print("=" * 70)
+    print(" Listening on : http://%s:%d/decompile" % (args.host, args.port))
+    print(" Decompiler   : %s" % UPSTREAM)
+    print(" API key      : not needed - any key you type is ignored")
+    print(" Game files   : .rbxl .rbxlx .rbxm .rbxmx  (all scripts get extracted)")
+    if WRITE_FILES:
+        print(" Extracted to : %s" % EXTRACT_DIR)
+    print()
+    print(" Open Oracle.html and drop a .luac file OR a whole game file.")
+    print(" Leave this window open while you use the tool. Ctrl+C to stop.")
+    print("=" * 70)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        srv.server_close()
+
+
+if __name__ == "__main__":
+    main()
