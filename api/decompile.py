@@ -1,45 +1,25 @@
 #!/usr/bin/env python3
 """
-Oracle local engine bridge  +  whole-game script extractor
-===========================================================
+Oracle decompiler - serverless endpoint (Vercel Python function)
+================================================================
 
-Runs a small local web server that Oracle.html talks to instead of the paid
-mshq.dev servers. Two things happen here:
+Accepts, as JSON on POST:
+  * {script|bytecode: <base64>, filename}  - one compiled Luau chunk, or
+    a whole Roblox place/model (.rbxl .rbxlx .rbxm .rbxmx) to unpack, or
+  * {oracle_upload: {id, index|finish, total, filename}, chunk}  - one piece
+    of a big file (hosts cap a single body at 4.5 MB), or
+  * {oracle_result: {id, part}}  - one piece of a big answer.
 
-1. COMPILED SCRIPT  (.luac / .luauc)
-   Forwarded to a free, open Luau decompiler engine that needs NO api key:
-       POST https://lunaux-decompiler.dev/api/decompile
-
-2. WHOLE GAME / MODEL  (.rbxl  .rbxlx  .rbxm  .rbxmx)
-   The file is unpacked locally and EVERY script inside is extracted:
-     * Roblox binary format (LZ4/ZSTD chunks, parsed here in pure Python)
-     * Roblox XML format
-   Scripts that still contain their source come out as real Lua, ready to read.
-   Scripts that only contain compiled bytecode are sent to the decompiler.
-   Results are returned in one document and also written to ./extracted/<file>/
-
-Because the engine needs no key, the API key box in Oracle.html is cosmetic:
-ANY key you type works, including keys that were revoked elsewhere.
-
-Usage
------
-    python3 oracle_server.py                  # 127.0.0.1:8787
-    python3 oracle_server.py --port 9000
-    python3 oracle_server.py --upstream URL
-    python3 oracle_server.py --no-write       # don't write extracted/ files
-
-Requires Python 3.8+, standard library only (ZSTD chunks additionally need
-`pip install zstandard`; LZ4 is handled by a built-in decoder).
+GET returns a small health JSON. No API key is required anywhere on this
+path, so the key typed in the page is never validated or rejected.
 """
 
-import argparse
 import base64
 import concurrent.futures
 import json
 import os
 import re
 import struct
-import sys
 import tempfile
 import time
 import gzip
@@ -47,7 +27,7 @@ import urllib.error
 import urllib.request
 import zlib
 import xml.etree.ElementTree as ET
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 
 DEFAULT_UPSTREAM = "https://lunaux-decompiler.dev/api/decompile"
 UPSTREAM = DEFAULT_UPSTREAM
@@ -57,8 +37,8 @@ MAX_SCRIPTS = 20000
 MAX_OUTPUT = 64 * 1024 * 1024          # bytes of text returned to the editor
 WORKERS = 8                            # parallel engine calls for big places
 MOPUP_BUDGET = 150                     # seconds for the slow retry of a burst's refusals
-WRITE_FILES = True
-EXTRACT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "extracted")
+WRITE_FILES = False
+EXTRACT_DIR = "/tmp/extracted"
 
 # ---- chunked transfer -------------------------------------------------------
 # Hosts such as Vercel cap a single request *and* response body at 4.5 MB. Files
@@ -2096,10 +2076,14 @@ def _strip_engine_banner(text):
 #   * `x += n` goes back to `x = x + n` - that one is a real engine option
 #     (transformCompoundAssignments=false), sent with every request below.
 #
-# What CANNOT be reproduced: the original's variable names (Seed_Shop, u30,
-# t1...) and its blank-line rhythm come from inside the private engine that
-# printed it; renaming identifiers here could break working code, so names
-# stay exactly as LunaUX recovered them.
+# Names: LunaUX demotes a recovered function name into a comment and binds
+# the function to `_` or a slot name; the Original prints the name itself.
+# _materialize_named() gives those names back - but ONLY behind hard gates
+# (valid non-keyword name, name free in the whole script, no `_` reference to
+# redirect, string/field/key-aware scanner, post-edit count check, and any
+# anomaly throws the whole rename away).  Anonymous locals (Frames/config vs
+# u30/t1) and the blank-line rhythm stay the engine's own - inventing those
+# could break working code.
 
 _LINE_COMMENT = re.compile(r'--\[\[\s*Line:\s*(\d+)(?:\s*\|\s*Named\s*"([^"]*)")?\s*\]\][ \t]*$')
 _LOCAL_DISCARD = re.compile(r'^([ \t]*)local _(?:[ \t]*,[ \t]*_)*[ \t]*=[ \t]*(.+?)[ \t]*$')
@@ -2140,10 +2124,270 @@ def _bare_call(rhs):
     return rhs if depth == 0 and in_str is None else None
 
 
+_KEYWORDS = frozenset((
+    "and break continue do else elseif end false for function if in local nil not "
+    "or repeat return then true until while").split())
+_NAMED_A = re.compile(r'^([ \t]*)local function (_|[a-z]{1,3}[0-9]{1,4})\((.*)\)'
+                      r' -- line: ([0-9]+) \| named "([^"]+)"$')
+_NAMED_B = re.compile(r'^([ \t]*)local (_|[a-z]{1,3}[0-9]{1,4}) = function\((.*)\)'
+                      r' -- line: ([0-9]+) \| named "([^"]+)"$')
+_NAMED_TAIL = re.compile(r'( -- line: [0-9]+) \| named "[^"]*"$', re.M)
+_NAMED_BLOCK = re.compile(r'\s*\| Named "[^"]*"( \]\])')
+_IDENT_OK = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+_LEVEL_OPEN = re.compile(r'\[(=*)\[')
+
+
+def _char_mask(text):
+    """Per-character mask: 'c' code, 's' string literal, 'm' comment.  Tracks
+    short quotes, long strings [[..]]/[==[..]==] and long comments across
+    lines, so restyling can never touch text inside a string."""
+    mask = ['c'] * len(text)
+    i, n, long_open = 0, len(text), None
+    while i < n:
+        ch = text[i]
+        if long_open is not None:
+            mask[i] = long_open[1]
+            if ch == ']':
+                mm = re.match(r'\](=*)\]', text[i:])
+                if mm and len(mm.group(1)) == long_open[0]:
+                    for k in range(i, i + len(mm.group(0))):
+                        mask[k] = long_open[1]
+                    i += len(mm.group(0))
+                    long_open = None
+                    continue
+            i += 1
+            continue
+        if ch == '\n':
+            i += 1
+            continue
+        if text.startswith('--', i):
+            mm = re.match(r'--\[(=*)\[', text[i:])
+            if mm:
+                lvl = len(mm.group(1))
+                for k in range(i, i + len(mm.group(0))):
+                    mask[k] = 'm'
+                i += len(mm.group(0))
+                long_open = (lvl, 'm')
+                continue
+            j = text.find('\n', i)
+            j = n if j < 0 else j
+            for k in range(i, j):
+                mask[k] = 'm'
+            i = j
+            continue
+        if ch in '"\'':
+            mask[i] = 's'
+            i += 1
+            while i < n:
+                c2 = text[i]
+                mask[i] = 's'
+                i += 1
+                if c2 == '\\' and i < n:
+                    mask[i] = 's'
+                    i += 1
+                    continue
+                if c2 == ch or c2 == '\n':
+                    break
+            continue
+        if ch == '[':
+            mm = _LEVEL_OPEN.match(text, i)
+            if mm:
+                for k in range(i, mm.end()):
+                    mask[k] = 's'
+                i = mm.end()
+                long_open = (len(mm.group(1)), 's')
+                continue
+        i += 1
+    return mask
+
+
+def _word_tokens(text, mask, kinds):
+    """Yield (start, end, word) for every identifier token whose characters all
+    live in mask kinds `kinds` (e.g. 'c' for code only, 'cm' for code+comments)."""
+    for m in re.finditer(r'[A-Za-z_][A-Za-z0-9_]*', text):
+        if all(mask[k] in kinds for k in range(m.start(), m.end())):
+            yield m.start(), m.end(), m.group(0)
+
+
+def _prev_word(text, p):
+    """The identifier word ending just before position p (skipping blanks)."""
+    q = p - 1
+    while q >= 0 and text[q] in ' \t':
+        q -= 1
+    e = q + 1
+    while q >= 0 and (text[q].isalnum() or text[q] == '_'):
+        q -= 1
+    return text[q + 1:e]
+
+
+def _next_nonspace(text, p):
+    q = p
+    while q < len(text) and text[q] in ' \t':
+        q += 1
+    return text[q:q + 2]
+
+
+def _underscore_refs_ok(text, mask, decl_positions):
+    """True when every `_` code token is a harmless binding (discard local,
+    for-loop variable, function parameter) and NOT a read/call of some `_`
+    function - only then may `_` declarations be renamed without redirecting
+    a single reference.  Any doubt counts as a reference (rename aborted)."""
+    for start, end, word in _word_tokens(text, mask, 'c'):
+        if word != '_' or start in decl_positions:
+            continue
+        nxt = _next_nonspace(text, end)
+        prev = text[start - 1] if start > 0 else ''
+        pw = _prev_word(text, start)
+        if pw == 'local' and nxt.startswith('=') and not nxt.startswith('=='):
+            continue                                    # local _ = ...  (binding)
+        if pw == 'for' and (nxt.startswith('=') or nxt.startswith(',') or nxt.startswith('in')):
+            continue                                    # for _ = / for _, v
+        if nxt.startswith('in'):
+            continue                                    # ... , _ in pairs(...)
+        if prev in '(,':
+            # parameter list or argument list?  Find the opening paren and see
+            # whether `function` introduces it.
+            depth, q = 0, start - 1
+            open_at = -1
+            while q >= 0:
+                if mask[q] == 'c':
+                    if text[q] == ')':
+                        depth += 1
+                    elif text[q] == '(':
+                        if depth == 0:
+                            open_at = q
+                            break
+                        depth -= 1
+                q -= 1
+            if open_at < 0:
+                return False
+            w1 = _prev_word(text, open_at)
+            w0 = _prev_word(text, open_at - len(w1)) if w1 else ''
+            if w1 == 'function' or w0 == 'function':
+                continue                                # function(a, _)  (parameter)
+            return False                                # f(a, _)  (a real read)
+        return False                                    # anything else: a read/call
+    return True
+
+
+def _materialize_named(text):
+    """Give named functions their real names back, the way the Original reads.
+
+    LunaUX demotes recovered debug names into a comment and binds the function
+    to `_` (or a slot name like v78):
+
+        local function _(p1, p2) -- line: 203 | named "HasBeenAssignedThisABTest"
+
+    The Original prints the name itself:
+
+        local function HasBeenAssignedThisABTest(p2, s1: string) -- line: 204
+
+    Renaming an identifier is only safe under hard gates, so a rename happens
+    ONLY when all of these hold - otherwise the text is kept as it is:
+
+      * the real name is a valid identifier, not a Luau keyword;
+      * the real name appears NOWHERE else in the script (no shadowing, no
+        collision with keys, globals or other locals);
+      * for `_` declarations: the script contains no read/call of `_` at all
+        (only bindings/parameters), so nothing has to be redirected;
+      * for slot names (v78...): every code occurrence is redirected with a
+        string/comment-aware scanner, fields (.v78) and table keys ({v78=...})
+        abort the rename, and two slots never share one target name;
+      * after editing, token counts are re-checked; ANY anomaly and the whole
+        pass is thrown away and the unrenamed text is returned.
+    """
+    try:
+        lines = text.split('\n')
+        offs, o = [], 0
+        for ln in lines:
+            offs.append(o)
+            o += len(ln) + 1
+        mask = _char_mask(text)
+
+        cands = []
+        for idx, ln in enumerate(lines):
+            m = _NAMED_A.match(ln) or _NAMED_B.match(ln)
+            if m:
+                cands.append({'idx': idx, 'id': m.group(2), 'X': m.group(5),
+                              'decl_at': offs[idx] + m.start(2), 'formA': ln.lstrip().startswith('local function')})
+        # strip every named-tail first: the scratch copy shows which names are
+        # genuinely free in the script
+        scratch = _NAMED_TAIL.sub(r'\1', text)
+        scratch = _NAMED_BLOCK.sub(r'\1', scratch)
+
+        approved_slots, used, decl_edits = {}, set(), []
+        slot_cands = [c for c in cands if c['id'] != '_']
+        under_cands = [c for c in cands if c['id'] == '_']
+
+        for c in slot_cands:
+            X = c['X']
+            if not _IDENT_OK.match(X) or X in _KEYWORDS or X == '_' or X in used:
+                continue
+            if re.search(r'\b%s\b' % re.escape(X), scratch):
+                continue
+            if approved_slots.get(c['id'], X) != X:
+                continue
+            if re.search(r'[{,][ \t]*%s[ \t]*=' % re.escape(c['id']), text):
+                continue                                # used as a table key
+            if re.search(r'\[[\"\']%s[\"\']\]' % re.escape(c['id']), text):
+                continue
+            approved_slots[c['id']] = X
+            used.add(X)
+
+        if under_cands and _underscore_refs_ok(text, mask, {c['decl_at'] for c in under_cands}):
+            for c in under_cands:
+                X = c['X']
+                if not _IDENT_OK.match(X) or X in _KEYWORDS or X == '_' or X in used:
+                    continue
+                if re.search(r'\b%s\b' % re.escape(X), scratch):
+                    continue
+                used.add(X)
+                decl_edits.append((c['idx'], c['id'], X))
+
+        if not approved_slots and not decl_edits:
+            return _NAMED_BLOCK.sub(r'\1', _NAMED_TAIL.sub(r'\1', text))
+
+        # ---- slot renames: redirect every code+comment occurrence ----------
+        edits = []
+        counts = {k: 0 for k in approved_slots}
+        for start, end, word in _word_tokens(text, mask, 'cm'):
+            if word in approved_slots:
+                before = text[start - 1] if start > 0 else ''
+                if mask[start] == 'c' and before in '.:':
+                    continue                            # field access: never renamed
+                edits.append((start, end, approved_slots[word]))
+                counts[word] += 1
+        out = text
+        for start, end, new in sorted(edits, reverse=True):
+            out = out[:start] + new + out[end:]
+        for k, v in counts.items():
+            if v == 0:
+                raise ValueError('slot %s vanished' % k)
+
+        # ---- `_` declaration renames (no reference exists to redirect) -----
+        if decl_edits:
+            lines = out.split('\n')
+            for idx, _id, X in decl_edits:
+                ln = lines[idx]
+                if _id == '_' and 'local function _(' in ln:
+                    lines[idx] = ln.replace('local function _(', 'local function %s(' % X, 1)
+                elif _id == '_':
+                    lines[idx] = ln.replace('local _ = function(', 'local %s = function(' % X, 1)
+            out = '\n'.join(lines)
+
+        # ---- the named tail is redundant now; the Original never shows it --
+        out = _NAMED_TAIL.sub(r'\1', out)
+        out = _NAMED_BLOCK.sub(r'\1', out)
+        return out
+    except Exception:
+        return text            # any surprise at all: keep the unrenamed text
+
+
 def _original_style(text):
     """Restyle decompiled engine output the way the Real Oracle Original reads.
-    Comment shapes and annotation cosmetics only - never an executable token.
-    Idempotent, and applied to engine answers only (kept source is untouched)."""
+    Comment shapes, annotation cosmetics and - behind hard safety gates - the
+    real names of functions.  Idempotent, and applied to engine answers only
+    (kept source is untouched)."""
     if not text:
         return text
     out = []
@@ -2169,7 +2413,7 @@ def _original_style(text):
         # inferred local-type annotation off
         line = _LOCAL_ANNOT.sub(r"\1 =", line, count=1)
         out.append(line)
-    return "\n".join(out)
+    return _materialize_named("\n".join(out))
 
 
 
@@ -2881,7 +3125,7 @@ def assemble(b64):
     return base64.b64decode(b64 + '=' * (-len(b64) % 4))
 
 
-class Handler(BaseHTTPRequestHandler):
+class handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "OracleLocalEngine/2.0"
 
@@ -2903,7 +3147,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("  %s\n" % (fmt % args))
+        pass    # Vercel already logs every request
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -2923,7 +3167,7 @@ class Handler(BaseHTTPRequestHandler):
         if self._route() in ("/", "/health", "/status", "/decompile"):
             self._reply(200, json.dumps({
                 "ok": True,
-                "build": "2026-10-23 - decompiled output restyled to match the Real Oracle Original",
+                "build": "2026-10-23 - Real Oracle Original style + real function names restored",
                 "bridge": "Oracle local engine",
                 "engine": UPSTREAM,
                 "needs_api_key": False,
@@ -3232,41 +3476,3 @@ class Handler(BaseHTTPRequestHandler):
             self._park_result(text)                 # too big for one reply
             return
         self._reply(status, text)
-
-
-def main():
-    global UPSTREAM, WRITE_FILES
-    ap = argparse.ArgumentParser(description="Local bridge for Oracle.html")
-    ap.add_argument("--port", type=int, default=8787)
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--upstream", default=DEFAULT_UPSTREAM)
-    ap.add_argument("--no-write", action="store_true",
-                    help="don't write extracted scripts to disk")
-    args = ap.parse_args()
-    UPSTREAM = args.upstream
-    WRITE_FILES = not args.no_write
-
-    srv = ThreadingHTTPServer((args.host, args.port), Handler)
-    print("=" * 70)
-    print(" Oracle local engine")
-    print("=" * 70)
-    print(" Listening on : http://%s:%d/decompile" % (args.host, args.port))
-    print(" Decompiler   : %s" % UPSTREAM)
-    print(" API key      : not needed - any key you type is ignored")
-    print(" Game files   : .rbxl .rbxlx .rbxm .rbxmx  (all scripts get extracted)")
-    if WRITE_FILES:
-        print(" Extracted to : %s" % EXTRACT_DIR)
-    print()
-    print(" Open Oracle.html and drop a .luac file OR a whole game file.")
-    print(" Leave this window open while you use the tool. Ctrl+C to stop.")
-    print("=" * 70)
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        print("\nStopped.")
-    finally:
-        srv.server_close()
-
-
-if __name__ == "__main__":
-    main()
