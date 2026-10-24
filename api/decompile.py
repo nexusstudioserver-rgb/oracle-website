@@ -39,6 +39,11 @@ MAX_SCRIPTS = 20000
 MAX_OUTPUT = 64 * 1024 * 1024          # bytes of text returned to the editor
 WORKERS = 8                            # parallel engine calls for big places
 MOPUP_BUDGET = 150                     # seconds for the slow retry of a burst's refusals
+PLACE_BUDGET = 210                     # seconds for one whole game request.  Hosts such
+                                       # as Vercel KILL a function at 300 s and then answer
+                                       # with their own error text, which the page cannot
+                                       # parse ("Unexpected token ...").  Stopping early
+                                       # with honest per-script notes beats being killed.
 WRITE_FILES = False
 EXTRACT_DIR = "/tmp/extracted"
 
@@ -2905,9 +2910,49 @@ def _force_openable_full(record, payload, notes):
     return had
 
 
+def _bounded_map(fn, items, deadline, workers):
+    """fn(item) -> (text, why) over every item, in parallel, but NEVER past
+    `deadline`: hosts kill over-long requests and answer with their own error
+    text, which the page cannot parse - honest partial results beat that.
+    Items the budget cut off come back as (None, None) and the caller writes
+    the honest note for them.  Calls already in flight (at most `workers`)
+    are allowed to finish - Python threads cannot be killed safely."""
+    out = [(None, None)] * len(items)
+    if not items:
+        return out
+    if len(items) == 1 or workers <= 1:
+        for i, it in enumerate(items):
+            if time.time() >= deadline:
+                break
+            out[i] = fn(it)
+        return out
+    futs = {}
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    try:
+        futs = {pool.submit(fn, it): i for i, it in enumerate(items)}
+        for fut in concurrent.futures.as_completed(futs):
+            i = futs[fut]
+            try:
+                out[i] = fut.result()
+            except Exception as exc:
+                out[i] = (None, str(exc))
+            if time.time() >= deadline:
+                break
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    for fut, i in list(futs.items()):       # salvage what finished while winding down
+        if out[i] == (None, None) and fut.done() and not fut.cancelled():
+            try:
+                out[i] = fut.result(timeout=0)
+            except Exception:
+                pass
+    return out
+
+
 def handle_place(raw, filename, decompile_one, compile_one=None):
     fmt = looks_like_place(raw)
     t0 = time.time()
+    deadline_all = t0 + PLACE_BUDGET
     if fmt == 'binary':
         scripts, count = parse_binary_place(raw)
     else:
@@ -2953,14 +2998,11 @@ def handle_place(raw, filename, decompile_one, compile_one=None):
                     time.sleep(0.6 * (attempt + 1))
             return None, why or "the engine did not answer"
 
-        texts, whys = [None] * len(todo), [None] * len(todo)
-        if len(todo) > 1 and WORKERS > 1:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
-                for i, (text, why) in enumerate(pool.map(_one, todo)):
-                    texts[i], whys[i] = text, why
-        else:
-            for i, s in enumerate(todo):
-                texts[i], whys[i] = _one(s)
+        out = _bounded_map(_one, todo, deadline_all, WORKERS)
+        texts = [r[0] for r in out]
+        whys = [r[1] if (r[0] or r[1]) else
+                "the time budget for this request ran out before the engine answered"
+                for r in out]
 
         # A big game asks for hundreds of scripts at once, and the free engine
         # starts refusing when a burst gets too hot.  Those refusals used to be
@@ -2972,7 +3014,7 @@ def handle_place(raw, filename, decompile_one, compile_one=None):
         if left:
             if len(todo) > 40:
                 time.sleep(2.0)                 # let the burst cool down first
-            deadline = t0 + MOPUP_BUDGET
+            deadline = min(t0 + MOPUP_BUDGET, deadline_all)
             for sweep in range(6):
                 if time.time() >= deadline:
                     break
@@ -3032,18 +3074,21 @@ def handle_place(raw, filename, decompile_one, compile_one=None):
                 return _translate_text(s['_cleaned_text'], s['path'],
                                        compile_one, decompile_one)
 
-            tr_texts, tr_whys = [None] * len(tr_todo), [None] * len(tr_todo)
-            if len(tr_todo) > 1 and WORKERS > 1:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
-                    for i, (text, why) in enumerate(pool.map(_tr_one, tr_todo)):
-                        tr_texts[i], tr_whys[i] = text, why
-            else:
-                for i, s in enumerate(tr_todo):
-                    tr_texts[i], tr_whys[i] = _tr_one(s)
+            out = _bounded_map(_tr_one, tr_todo, deadline_all, WORKERS)
+            tr_texts = [r[0] for r in out]
+            tr_whys = [r[1] if (r[0] or r[1]) else
+                       "the time budget for this request ran out before the translator "
+                       "got to this script"
+                       for r in out]
+            if any(not t and w and "time budget" in w
+                   for t, w in zip(tr_texts, tr_whys)):
+                notes.append("The time budget for one request ran out - the scripts the "
+                             "translator did not reach were kept exactly as saved; drop "
+                             "the file in again to translate more of them.")
 
             left = [i for i in range(len(tr_todo)) if not tr_texts[i]]
             if left:
-                deadline = t0 + MOPUP_BUDGET
+                deadline = min(t0 + MOPUP_BUDGET, deadline_all)
                 for i in left:
                     if time.time() >= deadline:
                         break
@@ -3304,10 +3349,22 @@ class handler(BaseHTTPRequestHandler):
         return path.rstrip("/") or "/"
 
     def do_GET(self):
+        # A leaked exception makes the HOST answer with its own error text,
+        # which the page cannot parse ("Unexpected token ...").  Catch here so
+        # an honest message of ours always reaches the page instead.
+        try:
+            self._get_inner()
+        except Exception as exc:
+            try:
+                self._reply(500, "Unexpected server problem: %s" % exc)
+            except Exception:
+                pass
+
+    def _get_inner(self):
         if self._route() in ("/", "/health", "/status", "/decompile"):
             self._reply(200, json.dumps({
                 "ok": True,
-                "build": "2026-10-23 - translator: stored old decompiled text re-read through real opcodes",
+                "build": "2026-10-24 - big games: time budget + honest server answers, never the host's error text",
                 "bridge": "Oracle local engine",
                 "engine": UPSTREAM,
                 "needs_api_key": False,
@@ -3590,6 +3647,24 @@ class handler(BaseHTTPRequestHandler):
                     "application/json")
 
     def do_POST(self):
+        # same catch-all as do_GET: whatever happens, the page must receive an
+        # answer IT can parse - never the host platform's own error text.
+        self._post_json_route = False
+        try:
+            self._post_inner()
+        except Exception as exc:
+            try:
+                if self._post_json_route:
+                    self._reply(200, json.dumps({
+                        "ok": False,
+                        "error": "the server hit an unexpected problem: %s" % exc}),
+                        "application/json")
+                else:
+                    self._reply(500, "Unexpected server problem: %s" % exc)
+            except Exception:
+                pass
+
+    def _post_inner(self):
         # always drain the body first: replying before reading it leaves the rest
         # of the request in the socket and breaks the next request on a kept-alive
         # connection (this is what a proxy sees as a broken pipe)
@@ -3609,6 +3684,11 @@ class handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._reply(400, "Could not read the request body: %s" % exc)
             return
+
+        # the routes the page reads as JSON (oracle_result pieces and the
+        # single-file answer travel as plain text, so those stay text-shaped)
+        self._post_json_route = any(isinstance(data.get(k), dict) for k in
+                                    ("oracle_build", "oracle_upload"))
 
         if isinstance(data.get("oracle_build"), dict):
             self._handle_build(data)
