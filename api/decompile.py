@@ -34,19 +34,27 @@ UPSTREAM = DEFAULT_UPSTREAM
 DEFAULT_COMPILE_UPSTREAM = "https://lunaux-decompiler.dev/api/compile"
 COMPILE_UPSTREAM = DEFAULT_COMPILE_UPSTREAM
 ALLOWED_ORIGIN = "*"
-TIMEOUT = 40                           # one engine call must fit inside the host's
+TIMEOUT = 25                           # one engine call must fit inside the host's
                                        # 60 s function limit (see vercel.json maxDuration)
 MAX_SCRIPTS = 20000
 MAX_OUTPUT = 64 * 1024 * 1024          # bytes of text returned to the editor
 WORKERS = 8                            # parallel engine calls for big places
 MOPUP_BUDGET = 150                     # seconds for the slow retry of a burst's refusals
-PLACE_BUDGET = 45                      # seconds for one whole game request.  The host
-                                       # (Vercel) answers with "An error occurred with
-                                       # your deployment FUNCTION_INVOCATION_TIMEOUT" -
-                                       # plain text the page cannot parse - when a
+PLACE_BUDGET = 45                      # seconds for the engine work of one game request.
+                                       # The host (Vercel) answers with "An error occurred
+                                       # with your deployment FUNCTION_INVOCATION_TIMEOUT"
+                                       # - plain text the page cannot parse - when a
                                        # function runs past maxDuration (60 s).  The
                                        # budget stops the engine bursts in time, so the
                                        # request ALWAYS answers with an honest document.
+REQUEST_DEADLINE = 55                  # s: the whole finish call must answer before this
+EST_EDIT_FIXED = 2.0                   # measured cost of the whole-file rebuild + checks:
+EST_EDIT_PER_MB = 3.0                  # ~2.4 s per MB of game file, with margin on top.
+BUILD_EST_PER_MB = 2.6                 # same estimate at the Download click
+                                       # When the rebuild cannot fit in the SAME request
+                                       # as the engine bursts, it moves to the Download
+                                       # click, which is a request of its own with its own
+                                       # time limit - the document itself always arrives.
 WRITE_FILES = False
 EXTRACT_DIR = "/tmp/extracted"
 
@@ -2434,6 +2442,8 @@ def _translate_text(cleaned, path, compile_fn, decompile_fn, deadline=None):
             return None, why or "the time budget for this request ran out"
         try:
             b64bc = compile_fn(_original_style(cleaned))
+            if deadline is not None and time.time() >= deadline:
+                return None, why or "the time budget for this request ran out"
             if not b64bc or not b64bc.strip():
                 why = "the engine could not compile the stored text"
             else:
@@ -2917,6 +2927,48 @@ def _force_openable_full(record, payload, notes):
     return had
 
 
+def deferred_full(record, pid, deadline):
+    """The whole-game rebuild, deferred to the Download click.
+
+    Big games cannot carry the engine bursts AND the rebuild (measured at
+    ~2.4 s per MB of file, plus the Studio-open checks) inside one 60-second
+    host request - the host kills the request and answers with text the page
+    cannot parse.  So handle_place parks the original file and the swap map
+    instead, and the rebuild happens here, in a request of its own.  Returns
+    the rebuilt blob (and caches it on the record and on disk), or None when
+    the rebuild would not fit in THIS request's time limit either - then the
+    download falls back to the scripts-and-folders place, honestly."""
+    try:
+        raw = record.get("_raw")
+        if raw is None:
+            raw = tx_load("rawplace", pid)
+        if not raw:
+            return None
+        if time.time() + EST_EDIT_FIXED + BUILD_EST_PER_MB * (len(raw) / 1e6) > deadline:
+            return None                      # would run into the host's kill
+        texts = {int(k): v for k, v in (record.get("texts") or {}).items()}
+        rewritten = set(record.get("rewritten") or [])
+        fmt = looks_like_place(raw) or record.get("fmt")
+        kind = record.get("editkind") or "rbxl"
+        if fmt == 'binary':
+            blob = edit_binary_place(raw, texts, rewritten)
+            if check_binary_place(blob) != []:
+                return None                  # never hand over a file Studio refuses
+        elif fmt == 'xml':
+            import xml.etree.ElementTree as _ET
+            blob = edit_xml_place(raw, texts, rewritten)
+            _ET.fromstring(blob.decode("utf-8", "replace"))
+        else:
+            return None
+        record["full"] = blob
+        record["fullkind"] = kind
+        record["ts"] = time.time()
+        tx_save("fullplace", pid, blob)
+        return blob
+    except Exception:
+        return None
+
+
 def _bounded_map(fn, items, deadline, workers):
     """fn(item) -> (text, why) over every item, in parallel, but NEVER past
     `deadline`: hosts kill over-long requests and answer with their own error
@@ -3160,34 +3212,64 @@ def handle_place(raw, filename, decompile_one, compile_one=None):
                     rewritten.add(s['ref'])
         kept = len([s for s in scripts if s.get('ref') is not None and not s.get('ok')])
         record = {"name": filename, "scripts": payload, "ts": time.time()}
-        # the whole game: every instance kept, the script sources swapped
-        try:
-            ext = os.path.splitext(filename or "")[1].lower()
-            if fmt == 'binary':
-                record["full"] = edit_binary_place(raw, texts, rewritten)
-                record["fullkind"] = {"rbxm": "rbxm", "rbxmx": "rbxmx"}.get(ext.lstrip("."), "rbxl")
-            else:
-                record["full"] = edit_xml_place(raw, texts, rewritten)
-                record["fullkind"] = "rbxmx" if ext == ".rbxmx" else "rbxlx"
-        except Exception as exc:
-            notes.append("Could not rebuild the whole game (%s); the .rbxl will hold "
-                         "the scripts and their folders." % exc)
-        _force_openable_full(record, payload, notes)
+        ext = os.path.splitext(filename or "")[1].lower()
+        if fmt == 'binary':
+            editkind = {"rbxm": "rbxm", "rbxmx": "rbxmx"}.get(ext.lstrip("."), "rbxl")
+        else:
+            editkind = "rbxmx" if ext == ".rbxmx" else "rbxlx"
+        # the whole game: every instance kept, the script sources swapped.
+        # That rebuild costs ~3 s per MB of file - when it cannot fit in the
+        # same host request as the engine work, it is deferred to the Download
+        # click (see deferred_full): the document must arrive in time, always.
+        est_edit = EST_EDIT_FIXED + EST_EDIT_PER_MB * (len(raw) / 1e6)
+        if time.time() + est_edit > t0 + REQUEST_DEADLINE:
+            record["texts"] = {str(k): v for k, v in texts.items()}
+            record["rewritten"] = sorted(rewritten)
+            record["fmt"] = fmt
+            record["editkind"] = editkind
+            record["_raw"] = raw
+            notes.append("This game is big enough that rebuilding the whole file would "
+                         "not fit in this request's time limit - the rebuild moves to the "
+                         "Download click, which gets a time limit of its own. The document "
+                         "below is complete.")
+        else:
+            try:
+                if fmt == 'binary':
+                    record["full"] = edit_binary_place(raw, texts, rewritten)
+                else:
+                    record["full"] = edit_xml_place(raw, texts, rewritten)
+                record["fullkind"] = editkind
+            except Exception as exc:
+                notes.append("Could not rebuild the whole game (%s); the .rbxl will hold "
+                             "the scripts and their folders." % exc)
+            _force_openable_full(record, payload, notes)
         if kept:
             notes.append("Kept the original code of %d script(s) the engine did not "
                          "answer - the whole-game file has no empty scripts." % kept)
         _PLACES[place_id] = record
         try:
             tx_save("place", place_id, json.dumps(payload).encode("utf-8"))
+            if record.get("texts") is not None:
+                tx_save("rawplace", place_id, raw)
+                tx_save("placeedit", place_id, json.dumps({
+                    "texts": record["texts"], "rewritten": record["rewritten"],
+                    "fmt": fmt, "editkind": editkind}).encode("utf-8"))
             if record.get("full"):
                 tx_save("fullplace", place_id, record["full"])
         except Exception:
             pass
 
     full_info = None
-    if place_id and _PLACES.get(place_id, {}).get("full"):
-        full_info = {"id": place_id, "bytes": len(_PLACES[place_id]["full"]),
-                     "name": filename, "kind": _PLACES[place_id].get("fullkind", "rbxl")}
+    if place_id:
+        rec = _PLACES.get(place_id) or {}
+        if rec.get("full"):
+            full_info = {"id": place_id, "bytes": len(rec["full"]),
+                         "name": filename, "kind": rec.get("fullkind", "rbxl")}
+        elif rec.get("texts") is not None:
+            # deferred rebuild: the whole game is still promised, the rebuild
+            # just happens when Download is pressed
+            full_info = {"id": place_id, "bytes": len(raw),
+                         "name": filename, "kind": rec.get("editkind", "rbxl")}
     doc = render_document(filename, scripts, count, fmt, extract_dir, notes, place_id, full_info)
     doc += "\n-- unpacked in %.2fs\n" % (time.time() - t0)
     return doc
@@ -3378,7 +3460,7 @@ class handler(BaseHTTPRequestHandler):
         if self._route() in ("/", "/health", "/status", "/decompile"):
             self._reply(200, json.dumps({
                 "ok": True,
-                "build": "2026-10-24 - host timeout fixed: maxDuration 60s + 45s work budget - the platform kill is gone",
+                "build": "2026-10-24 - huge games: the whole-file rebuild moved to the Download click - the document always arrives in time",
                 "bridge": "Oracle local engine",
                 "engine": UPSTREAM,
                 "needs_api_key": False,
@@ -3466,6 +3548,7 @@ class handler(BaseHTTPRequestHandler):
         pieces (base64 text, so it can travel the same way big answers do)."""
         req = data.get("oracle_build") or {}
         pid = tx_id(req.get("id"))
+        tb0 = time.time()
         record = _PLACES.get(pid)
         if record is None:                       # the instance may have restarted
             blob = tx_load("place", pid)
@@ -3474,6 +3557,13 @@ class handler(BaseHTTPRequestHandler):
                     record = {"name": str(req.get("filename") or "game")[:200],
                               "scripts": json.loads(blob.decode("utf-8")),
                               "ts": time.time()}
+                    ed = tx_load("placeedit", pid)
+                    if ed:                       # a deferred rebuild was parked too
+                        ed = json.loads(ed.decode("utf-8"))
+                        record["texts"] = ed.get("texts") or {}
+                        record["rewritten"] = ed.get("rewritten") or []
+                        record["fmt"] = ed.get("fmt")
+                        record["editkind"] = ed.get("editkind")
                 except Exception:
                     record = None
         if record is not None and not record.get("fullkind"):
@@ -3495,6 +3585,10 @@ class handler(BaseHTTPRequestHandler):
                 blob = tx_load("fullplace", pid)
                 if blob is not None:
                     full = blob
+            if full is None and record.get("texts") is not None:
+                # the rebuild was deferred to this click (big game): do it now,
+                # inside this request's own time limit, or fall back honestly
+                full = deferred_full(record, pid, tb0 + REQUEST_DEADLINE)
             blob = full if full else build_binary_place(record["scripts"])
             is_full = bool(full)
             kind = record.get("fullkind", "rbxl") if is_full else "rbxl"
@@ -3524,15 +3618,18 @@ class handler(BaseHTTPRequestHandler):
             return
 
         tx_purge()
+        nbytes = len(blob)
         b64 = base64.b64encode(blob).decode("ascii")
+        del blob                                 # free the place blob early
         tid = tx_id("b%d-%s" % (int(time.time()), os.urandom(4).hex()))
         parts = split_text(b64)
         _RESULTS[tid] = {"parts": parts, "filename": record.get("name") or "game",
                          "ts": time.time()}
         tx_save("result", tid, b64.encode("ascii"))
+        del b64                                  # the parts hold their own copies
         self._reply(200, json.dumps({"ok": True, "full": is_full, "kind": kind,
                                      "result": {"id": tid, "parts": len(parts),
-                                                "bytes": len(blob)}}),
+                                                "bytes": nbytes}}),
                     "application/json")
 
     # ---- numbered pieces: how big files get in and big results get out -----
@@ -3592,6 +3689,7 @@ class handler(BaseHTTPRequestHandler):
         _UPLOADS.pop(tid, None)
         try:
             raw = assemble(blob)
+            del blob                             # free the joined base64 at once
         except Exception:
             self._reply(200, json.dumps({"ok": False,
                                          "error": "the transferred file was not valid base64"}),
@@ -3607,6 +3705,7 @@ class handler(BaseHTTPRequestHandler):
             return
 
         status, text = self._decompile(raw, slot["filename"], data.get("options"))
+        del raw                                  # the file itself is no longer needed
         if status != 200:
             self._reply(200, json.dumps({"ok": False, "error": text.strip()}), "application/json")
             return
