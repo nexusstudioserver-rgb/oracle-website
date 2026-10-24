@@ -34,16 +34,19 @@ UPSTREAM = DEFAULT_UPSTREAM
 DEFAULT_COMPILE_UPSTREAM = "https://lunaux-decompiler.dev/api/compile"
 COMPILE_UPSTREAM = DEFAULT_COMPILE_UPSTREAM
 ALLOWED_ORIGIN = "*"
-TIMEOUT = 120
+TIMEOUT = 40                           # one engine call must fit inside the host's
+                                       # 60 s function limit (see vercel.json maxDuration)
 MAX_SCRIPTS = 20000
 MAX_OUTPUT = 64 * 1024 * 1024          # bytes of text returned to the editor
 WORKERS = 8                            # parallel engine calls for big places
 MOPUP_BUDGET = 150                     # seconds for the slow retry of a burst's refusals
-PLACE_BUDGET = 210                     # seconds for one whole game request.  Hosts such
-                                       # as Vercel KILL a function at 300 s and then answer
-                                       # with their own error text, which the page cannot
-                                       # parse ("Unexpected token ...").  Stopping early
-                                       # with honest per-script notes beats being killed.
+PLACE_BUDGET = 45                      # seconds for one whole game request.  The host
+                                       # (Vercel) answers with "An error occurred with
+                                       # your deployment FUNCTION_INVOCATION_TIMEOUT" -
+                                       # plain text the page cannot parse - when a
+                                       # function runs past maxDuration (60 s).  The
+                                       # budget stops the engine bursts in time, so the
+                                       # request ALWAYS answers with an honest document.
 WRITE_FILES = False
 EXTRACT_DIR = "/tmp/extracted"
 
@@ -2413,10 +2416,12 @@ def _looks_like_old_output(text):
     return bool(_OLD_OUTPUT_MARK.search(text))
 
 
-def _translate_text(cleaned, path, compile_fn, decompile_fn):
+def _translate_text(cleaned, path, compile_fn, decompile_fn, deadline=None):
     """Stored old decompiled text -> (house-styled text, None) or (None, why).
     Compile to real bytecode, decompile it back, style it - three tries, the
-    same patience the compiled-script path has.
+    same patience the compiled-script path has, but never past `deadline`:
+    the host kills over-long requests and answers with text the page cannot
+    parse, so an honest "kept as saved" beats running out of time.
 
     The stored text is styled BEFORE it is compiled: that materializes the
     real function names (the old `| Named "onTouched"` comments) into the
@@ -2425,6 +2430,8 @@ def _translate_text(cleaned, path, compile_fn, decompile_fn):
     comes back wearing its real names, like the Original."""
     why = None
     for attempt in range(3):
+        if deadline is not None and time.time() >= deadline:
+            return None, why or "the time budget for this request ran out"
         try:
             b64bc = compile_fn(_original_style(cleaned))
             if not b64bc or not b64bc.strip():
@@ -2928,18 +2935,25 @@ def _bounded_map(fn, items, deadline, workers):
         return out
     futs = {}
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    over = False
     try:
         futs = {pool.submit(fn, it): i for i, it in enumerate(items)}
-        for fut in concurrent.futures.as_completed(futs):
-            i = futs[fut]
-            try:
-                out[i] = fut.result()
-            except Exception as exc:
-                out[i] = (None, str(exc))
-            if time.time() >= deadline:
-                break
+        try:
+            for fut in concurrent.futures.as_completed(
+                    futs, timeout=max(0.05, deadline - time.time())):
+                i = futs[fut]
+                try:
+                    out[i] = fut.result()
+                except Exception as exc:
+                    out[i] = (None, str(exc))
+        except concurrent.futures.TimeoutError:
+            over = True                      # a call is hanging - stop waiting on it
     finally:
-        pool.shutdown(wait=True, cancel_futures=True)
+        over = over or time.time() >= deadline
+        # over budget: do NOT wait for the threads still in flight (a hung
+        # engine call would push the request past the host's kill); they are
+        # abandoned and their scripts get the honest kept-as-saved note.
+        pool.shutdown(wait=not over, cancel_futures=True)
     for fut, i in list(futs.items()):       # salvage what finished while winding down
         if out[i] == (None, None) and fut.done() and not fut.cancelled():
             try:
@@ -3072,7 +3086,7 @@ def handle_place(raw, filename, decompile_one, compile_one=None):
 
             def _tr_one(s):
                 return _translate_text(s['_cleaned_text'], s['path'],
-                                       compile_one, decompile_one)
+                                       compile_one, decompile_one, deadline_all)
 
             out = _bounded_map(_tr_one, tr_todo, deadline_all, WORKERS)
             tr_texts = [r[0] for r in out]
@@ -3364,7 +3378,7 @@ class handler(BaseHTTPRequestHandler):
         if self._route() in ("/", "/health", "/status", "/decompile"):
             self._reply(200, json.dumps({
                 "ok": True,
-                "build": "2026-10-24 - big games: time budget + honest server answers, never the host's error text",
+                "build": "2026-10-24 - host timeout fixed: maxDuration 60s + 45s work budget - the platform kill is gone",
                 "bridge": "Oracle local engine",
                 "engine": UPSTREAM,
                 "needs_api_key": False,
@@ -3409,7 +3423,8 @@ class handler(BaseHTTPRequestHandler):
         if txt is not None:
             cleaned = _clean_kept_source(txt)
             if _looks_like_old_output(cleaned):
-                styled, why = _translate_text(cleaned, filename, forward_compile, forward_styled)
+                styled, why = _translate_text(cleaned, filename, forward_compile,
+                                          forward_styled, time.time() + PLACE_BUDGET)
                 if styled:
                     return 200, UNIVERSAL_SYN_LINE + "\n\n" + styled
                 return 400, (
