@@ -31,6 +31,8 @@ from http.server import BaseHTTPRequestHandler
 
 DEFAULT_UPSTREAM = "https://lunaux-decompiler.dev/api/decompile"
 UPSTREAM = DEFAULT_UPSTREAM
+DEFAULT_COMPILE_UPSTREAM = "https://lunaux-decompiler.dev/api/compile"
+COMPILE_UPSTREAM = DEFAULT_COMPILE_UPSTREAM
 ALLOWED_ORIGIN = "*"
 TIMEOUT = 120
 MAX_SCRIPTS = 20000
@@ -2383,6 +2385,58 @@ def _materialize_named(text):
         return text            # any surprise at all: keep the unrenamed text
 
 
+# ---- the translator ---------------------------------------------------------
+# A game that was downloaded from this site EARLIER holds the old site output
+# as stored text - there is no compiled code left in it, so there is nothing
+# to decompile and the stored text used to be shown exactly as it was: still
+# the old patch.  The owner asked for those scripts to be translated into the
+# house style, and there is an honest way to do it: the stored text is valid
+# Luau, so it is COMPILED back into real Luau opcodes by the engine and pushed
+# through the very same decompile + style pipeline as any compiled script.
+#
+# Only text carrying the engine's own fingerprint is translated:
+#     --[[ Line: 114 | Named "x" ]]  /  --[[ Line: 8 ]]
+# Real hand-written game source does not carry those, so a game's own text is
+# never touched.  The NEW house style (-- line: N, lowercase) is deliberately
+# not a fingerprint: a re-upload of a fresh download is already correct and
+# stays byte-pure.  If compiling or decompiling fails at any step, the stored
+# text is kept as saved, byte for byte, and the document says so.
+_OLD_OUTPUT_MARK = re.compile(r'--\[\[ Line: \d|\| Named "')
+
+
+def _looks_like_old_output(text):
+    return bool(_OLD_OUTPUT_MARK.search(text))
+
+
+def _translate_text(cleaned, path, compile_fn, decompile_fn):
+    """Stored old decompiled text -> (house-styled text, None) or (None, why).
+    Compile to real bytecode, decompile it back, style it - three tries, the
+    same patience the compiled-script path has.
+
+    The stored text is styled BEFORE it is compiled: that materializes the
+    real function names (the old `| Named "onTouched"` comments) into the
+    identifiers themselves, so the compiler carries them into the bytecode's
+    debug info and they survive the whole round trip - the translated script
+    comes back wearing its real names, like the Original."""
+    why = None
+    for attempt in range(3):
+        try:
+            b64bc = compile_fn(_original_style(cleaned))
+            if not b64bc or not b64bc.strip():
+                why = "the engine could not compile the stored text"
+            else:
+                payload = {"bytecode": b64bc.strip(), "filename": path}
+                text = decompile_fn(payload)
+                if text and text.strip():
+                    return _original_style(_strip_engine_banner(text)), None
+                why = "the engine sent an empty answer"
+        except Exception as exc:
+            why = str(exc)
+        if attempt < 2:
+            time.sleep(0.6 * (attempt + 1))
+    return None, why or "the translator did not answer"
+
+
 def _original_style(text):
     """Restyle decompiled engine output the way the Real Oracle Original reads.
     Comment shapes, annotation cosmetics and - behind hard safety gates - the
@@ -2663,11 +2717,17 @@ def oracle_verdict(s):
     honest record of what happened, kept OUT of the script text itself: every
     script wears only the UniversalSynSaveInstance line on top (place_body)."""
     if s.get('ok'):
+        if s.get('translated'):
+            return (UNIVERSAL_SYN_LINE
+                    + " - its stored decompiled text was translated back through the engine")
         return UNIVERSAL_SYN_LINE
     if s['bytecode'] and s.get('had_bytecode'):
         return "the engine could not decompile this script - its own code was kept"
     if not s['source'].strip():
         return "this script had no code in the file"
+    if s.get('translate_why'):
+        return ("kept as saved - the stored decompiled text could not be translated, "
+                "so it was kept exactly as stored")
     return "kept as saved - this script has no compiled code to decompile"
 
 
@@ -2728,7 +2788,9 @@ def render_document(name, scripts, instance_count, fmt, extract_dir=None, notes=
             head.append('-- @fullplace %s' % json.dumps(full_info))
     if extract_dir:
         head.append("-- Also written to: %s" % extract_dir)
-    head.append("-- Note: source that was still stored in the file is shown as-is;")
+    head.append("-- Note: source that was still stored in the file is shown as-is,")
+    head.append("--       except stored OLD decompiler output, which the translator")
+    head.append("--       re-reads through real opcodes into the house style;")
     head.append("--       bytecode-only scripts were sent to the decompiler.")
     for n in notes:
         head.append("-- " + n)
@@ -2843,7 +2905,7 @@ def _force_openable_full(record, payload, notes):
     return had
 
 
-def handle_place(raw, filename, decompile_one):
+def handle_place(raw, filename, decompile_one, compile_one=None):
     fmt = looks_like_place(raw)
     t0 = time.time()
     if fmt == 'binary':
@@ -2948,6 +3010,67 @@ def handle_place(raw, filename, decompile_one):
             notes.append("%d script(s) still missing - the engine was busy or refused them."
                          % (len(todo) - done))
 
+    # ---- the translator: stored OLD decompiled text -> real opcodes -> house
+    # style.  Only for scripts with no compiled code whose stored text carries
+    # the engine's fingerprint; anything else is the game's own text and stays
+    # byte-pure.  Any failure keeps the stored text and says so honestly.
+    if compile_one is not None:
+        tr_scripts = []
+        for s in scripts:
+            if s['bytecode'] or not s['source'].strip():
+                continue
+            cleaned = _clean_kept_source(s['source'].decode('utf-8', 'replace'))
+            if _looks_like_old_output(cleaned):
+                s['_cleaned_text'] = cleaned
+                tr_scripts.append(s)
+        if tr_scripts:
+            tr_todo = tr_scripts[:MAX_SCRIPTS]
+            notes.append("Translating %d stored decompiled script(s) back through "
+                         "real Luau opcodes..." % len(tr_todo))
+
+            def _tr_one(s):
+                return _translate_text(s['_cleaned_text'], s['path'],
+                                       compile_one, decompile_one)
+
+            tr_texts, tr_whys = [None] * len(tr_todo), [None] * len(tr_todo)
+            if len(tr_todo) > 1 and WORKERS > 1:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
+                    for i, (text, why) in enumerate(pool.map(_tr_one, tr_todo)):
+                        tr_texts[i], tr_whys[i] = text, why
+            else:
+                for i, s in enumerate(tr_todo):
+                    tr_texts[i], tr_whys[i] = _tr_one(s)
+
+            left = [i for i in range(len(tr_todo)) if not tr_texts[i]]
+            if left:
+                deadline = t0 + MOPUP_BUDGET
+                for i in left:
+                    if time.time() >= deadline:
+                        break
+                    text, why = _tr_one(tr_todo[i])
+                    if text:
+                        tr_texts[i], tr_whys[i] = text, None
+                    else:
+                        tr_whys[i] = why
+                    time.sleep(0.25)
+
+            tdone = 0
+            for s, text, why in zip(tr_todo, tr_texts, tr_whys):
+                s.pop('_cleaned_text', None)
+                if text:
+                    s['decompiled'] = text
+                    s['ok'] = True
+                    s['translated'] = True
+                    tdone += 1
+                else:
+                    s['translate_why'] = why
+            notes.append("Stored decompiled scripts translated into the house style: "
+                         "%d of %d." % (tdone, len(tr_todo)))
+            if tdone < len(tr_todo):
+                notes.append("%d stored script(s) the translator could not re-read - "
+                             "their stored text was kept exactly as saved."
+                             % (len(tr_todo) - tdone))
+
     extract_dir = None
     if WRITE_FILES and scripts:
         try:
@@ -3043,6 +3166,23 @@ def forward_styled(payload):
         opts.update(p["options"])
     p["options"] = opts
     return forward(p)
+
+
+def forward_compile(source_text):
+    """The engine's compile endpoint: Luau source text -> base64 bytecode, no
+    key needed.  This is the first half of the translator - stored old
+    decompiled text becomes REAL Luau opcodes again, so it can go back through
+    the decompiler and come out in the house style like any compiled script."""
+    body = json.dumps({"source": source_text}).encode()
+    req = urllib.request.Request(
+        COMPILE_UPSTREAM, data=body, method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "text/plain",
+            "User-Agent": "OracleLocalBridge/2.0 (local desktop tool)",
+        })
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        return resp.read().decode("utf-8", errors="replace").strip()
 
 
 def diagnose(raw):
@@ -3167,7 +3307,7 @@ class handler(BaseHTTPRequestHandler):
         if self._route() in ("/", "/health", "/status", "/decompile"):
             self._reply(200, json.dumps({
                 "ok": True,
-                "build": "2026-10-23 - Real Oracle Original style + real function names restored",
+                "build": "2026-10-23 - translator: stored old decompiled text re-read through real opcodes",
                 "bridge": "Oracle local engine",
                 "engine": UPSTREAM,
                 "needs_api_key": False,
@@ -3184,7 +3324,7 @@ class handler(BaseHTTPRequestHandler):
         """Return (status, text) for one uploaded file."""
         if looks_like_place(raw):
             try:
-                return 200, handle_place(raw, filename, forward_styled)
+                return 200, handle_place(raw, filename, forward_styled, forward_compile)
             except RbxError as exc:
                 return 400, str(exc)
             except Exception as exc:
@@ -3200,6 +3340,25 @@ class handler(BaseHTTPRequestHandler):
                 blob = None
             if blob:
                 raw = blob
+
+        # stored OLD decompiled text dropped in as a single file: the
+        # translator re-reads it through real Luau opcodes and answers in the
+        # house style.  Text without the engine's fingerprint falls through to
+        # the usual "this is text, send a compiled chunk" answer.
+        try:
+            txt = raw.decode('utf-8')
+        except UnicodeDecodeError:
+            txt = None
+        if txt is not None:
+            cleaned = _clean_kept_source(txt)
+            if _looks_like_old_output(cleaned):
+                styled, why = _translate_text(cleaned, filename, forward_compile, forward_styled)
+                if styled:
+                    return 200, UNIVERSAL_SYN_LINE + "\n\n" + styled
+                return 400, (
+                    "This file stores old decompiled text and the translator could not\n"
+                    "re-read it (%s).\n"
+                    "Send a COMPILED chunk (.luac / .luauc), or a whole game file." % why)
 
         note = diagnose(raw)
         if note:
