@@ -18,9 +18,11 @@ import base64
 import concurrent.futures
 import json
 import os
+import queue
 import re
 import struct
 import tempfile
+import threading
 import time
 import gzip
 import urllib.error
@@ -39,6 +41,12 @@ TIMEOUT = 25                           # one engine call must fit inside the hos
 MAX_SCRIPTS = 20000
 MAX_OUTPUT = 64 * 1024 * 1024          # bytes of text returned to the editor
 WORKERS = 8                            # parallel engine calls for big places
+COMPILE_GAP = 0.55                     # s between compile-endpoint calls: it rate-limits
+                                       # bursts with HTTP 429 (measured live: 8 at once
+                                       # loses over half, 16 at once loses everything, and
+                                       # the lockout lasts tens of seconds), while the
+                                       # decompile endpoint takes 8-way bursts happily.
+TRANSIENT_BACKOFF = 1.5                # s first backoff after a 429 (doubles per retry)
 MOPUP_BUDGET = 150                     # seconds for the slow retry of a burst's refusals
 PLACE_BUDGET = 45                      # seconds for the engine work of one game request.
                                        # The host (Vercel) answers with "An error occurred
@@ -2420,8 +2428,23 @@ def _materialize_named(text):
 _OLD_OUTPUT_MARK = re.compile(r'--\[\[ Line: \d|\| Named "')
 
 
-def _looks_like_old_output(text):
-    return bool(_OLD_OUTPUT_MARK.search(text))
+def _looks_like_old_output(text, raw=None):
+    """The translator's fingerprint gate.  `text` is the stored source after
+    top-line cleaning; `raw` is the stored source BEFORE cleaning.
+
+    Engine output is recognized two ways: the `--[[ Line: N ... | Named "x" ]]`
+    annotations the engine sprinkles over every function it decompiles, or -
+    for the rare scripts with no functions at all, which carry no annotations -
+    the engine's own banner at the top (`-- [[ lunaux-decompiler.dev ... ]]` /
+    `-- [[ Luau version ... ]]`).  A game's own hand-written source never
+    carries either, so it stays byte-pure (the round-32 contract)."""
+    if _OLD_OUTPUT_MARK.search(text):
+        return True
+    if raw:
+        head = raw[:600]
+        if 'lunaux-decompiler' in head or '-- [[ Luau version ' in head:
+            return True
+    return False
 
 
 def _translate_text(cleaned, path, compile_fn, decompile_fn, deadline=None):
@@ -2457,6 +2480,299 @@ def _translate_text(cleaned, path, compile_fn, decompile_fn, deadline=None):
         if attempt < 2:
             time.sleep(0.6 * (attempt + 1))
     return None, why or "the translator did not answer"
+
+
+def _wrap_translation_batch(batch_items, tok):
+    """Bundle stored scripts into ONE source for the engine's compile endpoint.
+
+    Every script is wrapped in a uniquely-named global function carrying a
+    sentinel print, so the decompiled batch can be split back into per-script
+    texts byte-exactly (proved against the one-at-a-time flow on the live
+    engine).  One batch = ONE compile call + ONE decompile call, so a 200
+    script game costs ~8 engine calls instead of 400 - and the engine's
+    compile endpoint has a ~30 call wall that the one-at-a-time flow could
+    never get past inside a single request.
+
+    Returns (source, deltas, spans): deltas[k] is subtracted from the
+    decompiled `Line: N` annotations so each part reads exactly like the
+    single-script flow; spans[k] = (first, last) source line of unit k, so a
+    SyntaxError from the engine can be mapped back to the offending script.
+    """
+    units = []
+    deltas = []
+    spans = []
+    cum = 0
+    for k, s in enumerate(batch_items):
+        deltas.append(cum + 2)
+        body = _original_style(s['_cleaned_text'])
+        unit = ('function f%s%d(...)\nprint("%s%d")\n%s\nend\n'
+                % (tok, k, tok, k, body))
+        spans.append((cum + 1, cum + unit.count("\n")))
+        units.append(unit)
+        cum += unit.count("\n") + 1          # +1: the joining blank line
+    return "\n".join(units), deltas, spans
+
+
+def _split_translation_batch(text, tok, count, deltas):
+    """Inverse of _wrap_translation_batch: cut the decompiled batch text back
+    into per-script house-style texts.  Returns None when the output does not
+    split cleanly (missing markers, empty parts) - the caller then falls back
+    to the proven one-at-a-time path, so a surprising batch can never corrupt
+    a script."""
+    clean = _strip_engine_banner(text)
+    pat = re.compile(r'^function f%s(\d+)\([^\n]*\n' % re.escape(tok), re.M)
+    ms = list(pat.finditer(clean))
+    if len(ms) != count:
+        return None
+    parts = [None] * count
+    for j, m in enumerate(ms):
+        k = int(m.group(1))
+        if k >= count or parts[k] is not None:
+            return None
+        endpos = ms[j + 1].start() if j + 1 < len(ms) else len(clean)
+        seg = clean[m.end():endpos]
+        e = seg.rfind("\nend")
+        if e >= 0:
+            seg = seg[:e]
+        lines = seg.split("\n")
+        if lines and lines[0].strip().startswith('print("%s%d"' % (tok, k)):
+            lines = lines[1:]
+        body = "\n".join(l[1:] if l.startswith("\t") else l
+                         for l in lines).strip("\n")
+        if not body.strip():
+            return None
+        d = deltas[k]
+        body = re.sub(r'(?i)(line: )(\d+)',
+                      lambda mm: mm.group(1) + str(max(1, int(mm.group(2)) - d)),
+                      body)
+        parts[k] = _original_style(body)
+    return parts
+
+
+def _translate_pipeline(items, compile_fn, decompile_fn, deadline, workers=WORKERS):
+    """Translate a whole burst of stored-old scripts WITHOUT hitting the
+    engine's rate-limit wall.
+
+    Measured live: the engine's COMPILE endpoint lets ~30 calls through, then
+    answers HTTP 429 for everything (the old one-at-a-time flow always died
+    at exactly 30 translated scripts on a big game), while the DECOMPILE
+    endpoint takes 8-way bursts happily.
+
+    So: scripts ride in BATCHES (_wrap_translation_batch) - one compile plus
+    one decompile per batch of up to 40 - a single producer paces the compile
+    calls under a hard CALL_BUDGET, and a pool of consumers decompiles the
+    batches in parallel.  When one stored text cannot be parsed, the engine's
+    SyntaxError names the exact line: the producer kicks that one script out
+    and recompiles the rest of the batch.  Whatever still fails falls back to
+    the proven one-at-a-time path while budget and deadline allow.  Returns
+    (text, why) pairs parallel to items; (None, None) means the budget ran
+    out before the item's turn - the caller writes the honest kept-as-saved
+    note.
+    """
+    out = [(None, None)] * len(items)
+    n = len(items)
+    if not n:
+        return out
+    tok = "ORC7S" + os.urandom(4).hex()
+    size = min(40, max(10, (n + 7) // 8))
+    batches = [list(range(i, min(i + size, n))) for i in range(0, n, size)]
+    jobs = queue.Queue()
+    fallback = []
+    lock = threading.Lock()
+    state = {"calls": 0}
+    CALL_BUDGET = 28                        # the engine wall is ~30: stay under
+
+    def consumer():
+        while True:
+            job = jobs.get()
+            if job is None:
+                return
+            try:
+                if job[0] == "batch":
+                    _, idxs, deltas, b64bc = job
+                    text = None
+                    for attempt in range(2):
+                        try:
+                            got = decompile_fn({"bytecode": b64bc,
+                                                "filename": "batch"})
+                            if got and got.strip():
+                                text = got
+                                break
+                        except Exception:
+                            pass
+                        if attempt == 0 and time.time() < deadline:
+                            time.sleep(0.3)
+                    parts = (_split_translation_batch(text, tok, len(idxs), deltas)
+                             if text else None)
+                    if parts:
+                        for i, p in zip(idxs, parts):
+                            out[i] = (p, None)
+                    else:
+                        with lock:
+                            fallback.extend(idxs)
+                else:
+                    _, i, b64bc = job
+                    why = None
+                    for attempt in range(2):
+                        try:
+                            text = decompile_fn({"bytecode": b64bc,
+                                                 "filename": items[i]['path']})
+                            if text and text.strip():
+                                out[i] = (_original_style(_strip_engine_banner(text)),
+                                          None)
+                                why = None
+                                break
+                            why = "the engine sent an empty answer"
+                        except Exception as exc:
+                            why = str(exc)
+                        if attempt == 0 and time.time() < deadline:
+                            time.sleep(0.3)
+                    if why:
+                        out[i] = (None, why)
+            finally:
+                jobs.task_done()
+
+    threads = []
+    for _ in range(max(2, min(int(workers), 8))):
+        th = threading.Thread(target=consumer, daemon=True)
+        th.start()
+        threads.append(th)
+
+    next_call = [time.time()]
+
+    def paced():
+        wait = next_call[0] - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        next_call[0] = time.time() + COMPILE_GAP
+
+    def compile_batch(idxs):
+        """One batch through the compile endpoint, repairing around scripts
+        the engine cannot parse.  Returns (bc, cur, deltas, kicked,
+        rate_limited): bc None + rate_limited -> the wall is up, do NOT spend
+        more calls; kicked = scripts the engine pointed at (kept, honest)."""
+        cur = list(idxs)
+        kicked = []
+        backoff = TRANSIENT_BACKOFF
+        transient = 0
+        generic = 0
+        for _repair in range(8):
+            src, deltas, spans = _wrap_translation_batch(
+                [items[i] for i in cur], tok)
+            while True:
+                if time.time() >= deadline or state["calls"] >= CALL_BUDGET:
+                    return None, cur, None, kicked, False
+                paced()
+                state["calls"] += 1
+                try:
+                    got = compile_fn(src)
+                    if got and got.strip():
+                        return got.strip(), cur, deltas, kicked, False
+                    return None, cur, None, kicked, False
+                except Exception as exc:
+                    code = getattr(exc, 'code', None)
+                    if code == 429:
+                        transient += 1
+                        if transient > 3 or time.time() + backoff >= deadline:
+                            return None, cur, None, kicked, True
+                        time.sleep(backoff)
+                        backoff *= 2
+                        continue
+                    body = b''
+                    if hasattr(exc, 'read'):
+                        try:
+                            body = exc.read()
+                        except Exception:
+                            body = b''
+                    m = re.search(rb'\((\d+),(\d+)\)', body) if code == 400 else None
+                    if m and len(cur) > 1:
+                        bad = int(m.group(1))
+                        k = next((j for j, (a, b) in enumerate(spans)
+                                  if a <= bad <= b), None)
+                        if k is not None:
+                            kicked.append(cur.pop(k))
+                            transient = 0
+                            break               # rebuild without it, recompile
+                    generic += 1
+                    if generic <= 2 and time.time() < deadline:
+                        time.sleep(0.3)
+                        continue
+                    return None, cur, None, kicked, False
+            # the only way out of the while without returning is a kick:
+            # rebuild the batch without that script and compile again
+        return None, cur, None, kicked, False
+
+    for idxs in batches:
+        if time.time() >= deadline or state["calls"] >= CALL_BUDGET:
+            break                               # the rest stay (None, None)
+        bc, cur, deltas, kicked, rate_limited = compile_batch(idxs)
+        for i in kicked:
+            out[i] = (None, "the engine could not compile the stored text")
+        if bc:
+            jobs.put(("batch", cur, deltas, bc))
+        elif rate_limited:
+            why = ("the time budget for this request ran out "
+                   "(the engine was rate-limiting)"
+                   if time.time() + TRANSIENT_BACKOFF >= deadline else
+                   "the engine's compile endpoint was rate-limiting this request")
+            for i in cur:
+                out[i] = (None, why)
+        else:
+            with lock:
+                fallback.extend(cur)
+
+    # let the batch decompiles land so the fallback list is complete
+    wait_until = min(deadline, time.time() + 30.0) + 5.0
+    while jobs.unfinished_tasks > 0 and time.time() < wait_until:
+        time.sleep(0.05)
+
+    with lock:
+        todo = sorted(set(fallback))
+    for i in todo:
+        if out[i] != (None, None):
+            continue
+        if time.time() >= deadline or state["calls"] >= CALL_BUDGET:
+            break
+        source = _original_style(items[i]['_cleaned_text'])
+        b64bc, why = None, None
+        backoff = TRANSIENT_BACKOFF
+        for attempt in range(3):
+            if time.time() >= deadline:
+                why = why or "the time budget for this request ran out"
+                break
+            paced()
+            state["calls"] += 1
+            try:
+                got = compile_fn(source)
+                if got and got.strip():
+                    b64bc = got
+                    break
+                why = "the engine could not compile the stored text"
+                break                           # content problem: retries won't help
+            except Exception as exc:
+                why = str(exc)
+                if getattr(exc, 'code', None) == 429:
+                    if time.time() + backoff >= deadline:
+                        why = ("the time budget for this request ran out "
+                               "(the engine was rate-limiting)")
+                        break
+                    time.sleep(backoff)         # "too fast" - slow down and retry
+                    backoff *= 2
+                    continue
+                if attempt < 2 and time.time() < deadline:
+                    time.sleep(0.3)
+                    continue
+                break
+        if b64bc:
+            jobs.put(("single", i, b64bc.strip()))
+        else:
+            out[i] = (None, why or "the translator did not answer")
+
+    for _ in threads:
+        jobs.put(None)
+    for th in threads:
+        th.join(timeout=max(0.0, deadline - time.time()) + 3.0)
+    return out
 
 
 def _original_style(text):
@@ -3127,8 +3443,9 @@ def handle_place(raw, filename, decompile_one, compile_one=None):
         for s in scripts:
             if s['bytecode'] or not s['source'].strip():
                 continue
-            cleaned = _clean_kept_source(s['source'].decode('utf-8', 'replace'))
-            if _looks_like_old_output(cleaned):
+            raw_txt = s['source'].decode('utf-8', 'replace')
+            cleaned = _clean_kept_source(raw_txt)
+            if _looks_like_old_output(cleaned, raw_txt):
                 s['_cleaned_text'] = cleaned
                 tr_scripts.append(s)
         if tr_scripts:
@@ -3136,11 +3453,10 @@ def handle_place(raw, filename, decompile_one, compile_one=None):
             notes.append("Translating %d stored decompiled script(s) back through "
                          "real Luau opcodes..." % len(tr_todo))
 
-            def _tr_one(s):
-                return _translate_text(s['_cleaned_text'], s['path'],
-                                       compile_one, decompile_one, deadline_all)
-
-            out = _bounded_map(_tr_one, tr_todo, deadline_all, WORKERS)
+            # rate-limit-aware: paced compile producer + parallel decompile
+            # consumers (see _translate_pipeline) - the old 8-worker storm lost
+            # most of a big game to HTTP 429
+            out = _translate_pipeline(tr_todo, compile_one, decompile_one, deadline_all)
             tr_texts = [r[0] for r in out]
             tr_whys = [r[1] if (r[0] or r[1]) else
                        "the time budget for this request ran out before the translator "
@@ -3151,19 +3467,6 @@ def handle_place(raw, filename, decompile_one, compile_one=None):
                 notes.append("The time budget for one request ran out - the scripts the "
                              "translator did not reach were kept exactly as saved; drop "
                              "the file in again to translate more of them.")
-
-            left = [i for i in range(len(tr_todo)) if not tr_texts[i]]
-            if left:
-                deadline = min(t0 + MOPUP_BUDGET, deadline_all)
-                for i in left:
-                    if time.time() >= deadline:
-                        break
-                    text, why = _tr_one(tr_todo[i])
-                    if text:
-                        tr_texts[i], tr_whys[i] = text, None
-                    else:
-                        tr_whys[i] = why
-                    time.sleep(0.25)
 
             tdone = 0
             for s, text, why in zip(tr_todo, tr_texts, tr_whys):
@@ -3460,7 +3763,7 @@ class handler(BaseHTTPRequestHandler):
         if self._route() in ("/", "/health", "/status", "/decompile"):
             self._reply(200, json.dumps({
                 "ok": True,
-                "build": "2026-10-24 - huge games: the whole-file rebuild moved to the Download click - the document always arrives in time",
+                "build": "2026-10-24 - translator batching fix: scripts ride through the real opcodes in batches of up to 40, not one engine call each - the 30-call rate-limit wall cannot stop a whole game anymore",
                 "bridge": "Oracle local engine",
                 "engine": UPSTREAM,
                 "needs_api_key": False,
@@ -3504,7 +3807,7 @@ class handler(BaseHTTPRequestHandler):
             txt = None
         if txt is not None:
             cleaned = _clean_kept_source(txt)
-            if _looks_like_old_output(cleaned):
+            if _looks_like_old_output(cleaned, txt):
                 styled, why = _translate_text(cleaned, filename, forward_compile,
                                           forward_styled, time.time() + PLACE_BUDGET)
                 if styled:
