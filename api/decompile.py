@@ -47,6 +47,9 @@ COMPILE_GAP = 0.55                     # s between compile-endpoint calls: it ra
                                        # the lockout lasts tens of seconds), while the
                                        # decompile endpoint takes 8-way bursts happily.
 TRANSIENT_BACKOFF = 1.5                # s first backoff after a 429 (doubles per retry)
+TRANSLATE_CALL_CAP = 10.0              # s a translator engine call may block the request
+                                       # thread before it is ABANDONED (the host kills at
+                                       # 60 s; a stalled socket must never ride the clock out)
 MOPUP_BUDGET = 150                     # seconds for the slow retry of a burst's refusals
 PLACE_BUDGET = 45                      # seconds for the engine work of one game request.
                                        # The host (Vercel) answers with "An error occurred
@@ -2447,12 +2450,57 @@ def _looks_like_old_output(text, raw=None):
     return False
 
 
+def _capped_call(fn, arg, cap):
+    """Run fn(arg) on a throwaway daemon thread and wait AT MOST `cap` seconds.
+
+    The request thread must never sit inside an engine socket while the
+    host's 60 s window counts down: a call that stalls (not refuses - goes
+    quiet, the way an overloaded proxy does) and started just before the
+    budget deadline would otherwise ride the whole request past the kill
+    line, and the platform's plain-text answer is what shows up on the page
+    as "Unexpected token 'A', \"An error o\"...".  A stalled call is
+    ABANDONED - the same design the decompile burst has had since round 34 -
+    and the script stays kept-as-saved with an honest note.
+
+    Returns (result, None) on success or (None, err) where err is the
+    exception to inspect (.code for a 429, .read() for a SyntaxError line),
+    or a synthesized TimeoutError when the call was abandoned."""
+    box = {}
+
+    def run():
+        try:
+            box['ok'] = fn(arg)
+        except Exception as exc:            # the caller inspects it honestly
+            box['err'] = exc
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    th.join(cap)
+    if th.is_alive():
+        return None, TimeoutError(
+            "the engine call stalled and was abandoned after %.0fs" % cap)
+    if 'err' in box:
+        return None, box['err']
+    return box.get('ok'), None
+
+
+def _call_cap(deadline):
+    """How long a translator engine call may block right now: the standing
+    cap, but never more than the time left before the request deadline
+    (minus a small assembly margin).  <= 0 means: do not start the call."""
+    if deadline is None:
+        return TRANSLATE_CALL_CAP
+    return min(TRANSLATE_CALL_CAP, deadline - time.time() - 0.5)
+
+
 def _translate_text(cleaned, path, compile_fn, decompile_fn, deadline=None):
     """Stored old decompiled text -> (house-styled text, None) or (None, why).
     Compile to real bytecode, decompile it back, style it - three tries, the
     same patience the compiled-script path has, but never past `deadline`:
     the host kills over-long requests and answers with text the page cannot
-    parse, so an honest "kept as saved" beats running out of time.
+    parse, so an honest "kept as saved" beats running out of time.  Every
+    engine call is capped (_capped_call): a stalled socket is abandoned, it
+    can never drag the request into the host's kill.
 
     The stored text is styled BEFORE it is compiled: that materializes the
     real function names (the old `| Named "onTouched"` comments) into the
@@ -2461,22 +2509,26 @@ def _translate_text(cleaned, path, compile_fn, decompile_fn, deadline=None):
     comes back wearing its real names, like the Original."""
     why = None
     for attempt in range(3):
-        if deadline is not None and time.time() >= deadline:
+        cap = _call_cap(deadline)
+        if cap <= 0:
             return None, why or "the time budget for this request ran out"
-        try:
-            b64bc = compile_fn(_original_style(cleaned))
-            if deadline is not None and time.time() >= deadline:
+        b64bc, err = _capped_call(compile_fn, _original_style(cleaned), cap)
+        if err is not None:
+            why = str(err)
+        elif not b64bc or not b64bc.strip():
+            why = "the engine could not compile the stored text"
+        else:
+            cap = _call_cap(deadline)
+            if cap <= 0:
                 return None, why or "the time budget for this request ran out"
-            if not b64bc or not b64bc.strip():
-                why = "the engine could not compile the stored text"
+            payload = {"bytecode": b64bc.strip(), "filename": path}
+            text, err = _capped_call(decompile_fn, payload, cap)
+            if err is not None:
+                why = str(err)
+            elif text and text.strip():
+                return _original_style(_strip_engine_banner(text)), None
             else:
-                payload = {"bytecode": b64bc.strip(), "filename": path}
-                text = decompile_fn(payload)
-                if text and text.strip():
-                    return _original_style(_strip_engine_banner(text)), None
                 why = "the engine sent an empty answer"
-        except Exception as exc:
-            why = str(exc)
         if attempt < 2:
             time.sleep(0.6 * (attempt + 1))
     return None, why or "the translator did not answer"
@@ -2660,44 +2712,47 @@ def _translate_pipeline(items, compile_fn, decompile_fn, deadline, workers=WORKE
             src, deltas, spans = _wrap_translation_batch(
                 [items[i] for i in cur], tok)
             while True:
-                if time.time() >= deadline or state["calls"] >= CALL_BUDGET:
+                cap = _call_cap(deadline)
+                if cap <= 0 or state["calls"] >= CALL_BUDGET:
                     return None, cur, None, kicked, False
                 paced()
                 state["calls"] += 1
-                try:
-                    got = compile_fn(src)
+                got, err = _capped_call(compile_fn, src, cap)
+                if err is None:
                     if got and got.strip():
                         return got.strip(), cur, deltas, kicked, False
                     return None, cur, None, kicked, False
-                except Exception as exc:
-                    code = getattr(exc, 'code', None)
-                    if code == 429:
-                        transient += 1
-                        if transient > 3 or time.time() + backoff >= deadline:
-                            return None, cur, None, kicked, True
-                        time.sleep(backoff)
-                        backoff *= 2
-                        continue
-                    body = b''
-                    if hasattr(exc, 'read'):
-                        try:
-                            body = exc.read()
-                        except Exception:
-                            body = b''
-                    m = re.search(rb'\((\d+),(\d+)\)', body) if code == 400 else None
-                    if m and len(cur) > 1:
-                        bad = int(m.group(1))
-                        k = next((j for j, (a, b) in enumerate(spans)
-                                  if a <= bad <= b), None)
-                        if k is not None:
-                            kicked.append(cur.pop(k))
-                            transient = 0
-                            break               # rebuild without it, recompile
-                    generic += 1
-                    if generic <= 2 and time.time() < deadline:
-                        time.sleep(0.3)
-                        continue
+                code = getattr(err, 'code', None)
+                if code == 429:
+                    transient += 1
+                    if transient > 3 or time.time() + backoff >= deadline:
+                        return None, cur, None, kicked, True
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+                body = b''
+                if hasattr(err, 'read'):
+                    try:
+                        body = err.read()
+                    except Exception:
+                        body = b''
+                m = re.search(rb'\((\d+),(\d+)\)', body) if code == 400 else None
+                if m and len(cur) > 1:
+                    bad = int(m.group(1))
+                    k = next((j for j, (a, b) in enumerate(spans)
+                              if a <= bad <= b), None)
+                    if k is not None:
+                        kicked.append(cur.pop(k))
+                        transient = 0
+                        break                   # rebuild without it, recompile
+                if isinstance(err, TimeoutError):
+                    # the engine is stalling, not refusing - do not keep poking
                     return None, cur, None, kicked, False
+                generic += 1
+                if generic <= 2 and time.time() < deadline:
+                    time.sleep(0.3)
+                    continue
+                return None, cur, None, kicked, False
             # the only way out of the while without returning is a kick:
             # rebuild the batch without that script and compile again
         return None, cur, None, kicked, False
@@ -2722,7 +2777,7 @@ def _translate_pipeline(items, compile_fn, decompile_fn, deadline, workers=WORKE
                 fallback.extend(cur)
 
     # let the batch decompiles land so the fallback list is complete
-    wait_until = min(deadline, time.time() + 30.0) + 5.0
+    wait_until = min(deadline, time.time() + 30.0) + 3.0
     while jobs.unfinished_tasks > 0 and time.time() < wait_until:
         time.sleep(0.05)
 
@@ -2737,32 +2792,34 @@ def _translate_pipeline(items, compile_fn, decompile_fn, deadline, workers=WORKE
         b64bc, why = None, None
         backoff = TRANSIENT_BACKOFF
         for attempt in range(3):
-            if time.time() >= deadline:
+            cap = _call_cap(deadline)
+            if cap <= 0:
                 why = why or "the time budget for this request ran out"
                 break
             paced()
             state["calls"] += 1
-            try:
-                got = compile_fn(source)
+            got, err = _capped_call(compile_fn, source, cap)
+            if err is None:
                 if got and got.strip():
                     b64bc = got
                     break
                 why = "the engine could not compile the stored text"
                 break                           # content problem: retries won't help
-            except Exception as exc:
-                why = str(exc)
-                if getattr(exc, 'code', None) == 429:
-                    if time.time() + backoff >= deadline:
-                        why = ("the time budget for this request ran out "
-                               "(the engine was rate-limiting)")
-                        break
-                    time.sleep(backoff)         # "too fast" - slow down and retry
-                    backoff *= 2
-                    continue
-                if attempt < 2 and time.time() < deadline:
-                    time.sleep(0.3)
-                    continue
-                break
+            why = str(err)
+            if getattr(err, 'code', None) == 429:
+                if time.time() + backoff >= deadline:
+                    why = ("the time budget for this request ran out "
+                           "(the engine was rate-limiting)")
+                    break
+                time.sleep(backoff)             # "too fast" - slow down and retry
+                backoff *= 2
+                continue
+            if isinstance(err, TimeoutError):
+                break                           # stalled engine: kept, honest
+            if attempt < 2 and time.time() < deadline:
+                time.sleep(0.3)
+                continue
+            break
         if b64bc:
             jobs.put(("single", i, b64bc.strip()))
         else:
@@ -2771,7 +2828,7 @@ def _translate_pipeline(items, compile_fn, decompile_fn, deadline, workers=WORKE
     for _ in threads:
         jobs.put(None)
     for th in threads:
-        th.join(timeout=max(0.0, deadline - time.time()) + 3.0)
+        th.join(timeout=max(0.0, deadline - time.time()) + 2.0)
     return out
 
 
@@ -3763,7 +3820,7 @@ class handler(BaseHTTPRequestHandler):
         if self._route() in ("/", "/health", "/status", "/decompile"):
             self._reply(200, json.dumps({
                 "ok": True,
-                "build": "2026-10-24 - translator batching fix: scripts ride through the real opcodes in batches of up to 40, not one engine call each - the 30-call rate-limit wall cannot stop a whole game anymore",
+                "build": "2026-10-25 - hang-proof translator: every engine call on the request thread is time-capped and abandoned if it stalls - a request can no longer be dragged into the host's 60 s kill",
                 "bridge": "Oracle local engine",
                 "engine": UPSTREAM,
                 "needs_api_key": False,
